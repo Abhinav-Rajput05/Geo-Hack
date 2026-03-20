@@ -1,0 +1,170 @@
+version: '3.8'
+
+services:
+  # Neo4j Graph Database
+  neo4j:
+    image: neo4j:5.15.0
+    container_name: ontology_neo4j
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/ontology123
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=1G
+      - NEO4J_dbms_memory_pagecache_size=512m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7474"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ontology_network
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: ontology_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=ontology_user
+      - POSTGRES_PASSWORD=ontology123
+      - POSTGRES_DB=ontology_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ontology_user -d ontology_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ontology_network
+
+  # Redis Cache and Queue
+  redis:
+    image: redis:7-alpine
+    container_name: ontology_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ontology_network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ontology_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=ontology123
+      - DATABASE_URL=postgresql://ontology_user:ontology123@postgres:5432/ontology_db
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - NEWS_API_KEY=${NEWS_API_KEY:-}
+      - ENVIRONMENT=development
+    volumes:
+      - ./backend:/app
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ontology_network
+
+  # Celery Worker for Background Tasks
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ontology_celery_worker
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=ontology123
+      - DATABASE_URL=postgresql://ontology_user:ontology123@postgres:5432/ontology_db
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - NEWS_API_KEY=${NEWS_API_KEY:-}
+      - ENVIRONMENT=development
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - backend
+      - redis
+    networks:
+      - ontology_network
+
+  # Celery Beat for Scheduled Tasks
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ontology_celery_beat
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=ontology123
+      - DATABASE_URL=postgresql://ontology_user:ontology123@postgres:5432/ontology_db
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - NEWS_API_KEY=${NEWS_API_KEY:-}
+      - ENVIRONMENT=development
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - backend
+      - redis
+    networks:
+      - ontology_network
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ontology_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - ontology_network
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_import:
+  postgres_data:
+  redis_data:
+
+networks:
+  ontology_network:
+    driver: bridge
