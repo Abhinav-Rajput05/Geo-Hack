@@ -3,6 +3,38 @@ import { motion } from 'framer-motion';
 import { Search, Send, MessageSquare, AlertCircle, CheckCircle } from 'lucide-react';
 import './QueryPage.css';
 
+const confidenceLevelToScore = (confidenceLevel) => {
+  if (confidenceLevel === 'high') return 0.9;
+  if (confidenceLevel === 'medium') return 0.65;
+  if (confidenceLevel === 'low') return 0.4;
+  return 0.5;
+};
+
+const normalizeQueryResponse = (payload) => {
+  const explanation = payload?.explanation || {};
+  const entities = Array.isArray(payload?.entities) ? payload.entities : [];
+  const supportingFacts = Array.isArray(explanation.supporting_facts)
+    ? explanation.supporting_facts
+    : [];
+
+  return {
+    answer: payload?.answer || 'No answer available.',
+    confidence: confidenceLevelToScore(explanation?.confidence_level),
+    reasoning_chain: Array.isArray(explanation.reasoning_chain) ? explanation.reasoning_chain : [],
+    supporting_facts: supportingFacts.map((fact) => ({
+      entity: fact.entity || fact.source_entity || 'Entity',
+      relation: fact.relation || fact.relationship || 'related to',
+      target: fact.target || fact.target_entity || fact.object || '',
+      source: fact.source || fact.origin || 'Knowledge Graph',
+    })),
+    related_entities: entities.map((entity) => ({
+      name: entity.name || 'Unknown',
+      type: entity.type || 'Unknown',
+      impact: Math.round(Number(entity.relevance_score || 0) * 100),
+    })),
+  };
+};
+
 const QueryPage = () => {
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
@@ -18,32 +50,43 @@ const QueryPage = () => {
     if (!query.trim()) return;
 
     setLoading(true);
-    
-    // Simulate API call
-    setTimeout(() => {
-      setResult({
-        answer: "Based on the current knowledge graph, the geopolitical situation in Eastern Europe remains highly volatile. NATO expansion continues to be a key tension point, with Russia viewing it as a direct security threat. The conflict in Ukraine has led to significant shifts in military deployments and economic sanctions.",
-        confidence: 0.92,
-        reasoning_chain: [
-          "Analyzed 1,247 related entities in the knowledge graph",
-          "Identified key relationship: NATO ←→ Russia (tension level: high)",
-          "Traced economic impact through trade sanctions network",
-          "Cross-referenced with 45 recent news articles"
-        ],
-        supporting_facts: [
-          { entity: 'NATO', relation: 'expanding', target: 'Eastern Europe', source: 'Reuters, Jan 2024' },
-          { entity: 'Russia', relation: 'opposes', target: 'NATO expansion', source: 'Kremlin statement' },
-          { entity: 'Sanctions', relation: 'affecting', target: 'Russian economy', source: 'EU report' }
-        ],
-        related_entities: [
-          { name: 'NATO', type: 'Organization', impact: 85 },
-          { name: 'Russia', type: 'Country', impact: 92 },
-          { name: 'Ukraine', type: 'Country', impact: 95 },
-          { name: 'United States', type: 'Country', impact: 78 }
-        ]
+
+    try {
+      const response = await fetch('/api/v1/query', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          question: query.trim(),
+        }),
       });
+
+      if (!response.ok) {
+        throw new Error(`Request failed with status ${response.status}`);
+      }
+
+      const payload = await response.json();
+      setResult(normalizeQueryResponse(payload));
+      setHistory((prev) => [
+        {
+          id: Date.now(),
+          question: query.trim(),
+          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        },
+        ...prev.slice(0, 9),
+      ]);
+    } catch (error) {
+      setResult({
+        answer: 'Unable to fetch query result right now. Please try again.',
+        confidence: 0,
+        reasoning_chain: [],
+        supporting_facts: [],
+        related_entities: [],
+      });
+    } finally {
       setLoading(false);
-    }, 2000);
+    }
   };
 
   return (
@@ -54,7 +97,7 @@ const QueryPage = () => {
       </div>
 
       {/* Query Input */}
-      <motion.div 
+      <motion.div
         className="query-input-card card"
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -70,8 +113,8 @@ const QueryPage = () => {
               className="query-input"
             />
           </div>
-          <button 
-            type="submit" 
+          <button
+            type="submit"
             className="btn btn-primary"
             disabled={loading || !query.trim()}
           >
@@ -110,7 +153,7 @@ const QueryPage = () => {
 
       {/* Results */}
       {result && (
-        <motion.div 
+        <motion.div
           className="result-card card"
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -163,8 +206,8 @@ const QueryPage = () => {
                 <div key={index} className="entity-chip">
                   <span className="entity-name">{entity.name}</span>
                   <span className="entity-type">{entity.type}</span>
-                  <span className="entity-impact" style={{ 
-                    color: entity.impact > 80 ? '#ef4444' : entity.impact > 60 ? '#f59e0b' : '#10b981' 
+                  <span className="entity-impact" style={{
+                    color: entity.impact > 80 ? '#ef4444' : entity.impact > 60 ? '#f59e0b' : '#10b981'
                   }}>
                     {entity.impact}% impact
                   </span>
@@ -180,8 +223,8 @@ const QueryPage = () => {
         <h3>Recent Queries</h3>
         <div className="history-list">
           {history.map((item) => (
-            <div 
-              key={item.id} 
+            <div
+              key={item.id}
               className="history-item"
               onClick={() => setQuery(item.question)}
             >
