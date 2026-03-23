@@ -8,7 +8,7 @@ load_dotenv()
 # Load environment variables
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 openrouter_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-openai_model = os.getenv("OPENAI_MODEL", "gpt-4-turbo-preview")
+openai_model = os.getenv("OPENAI_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 
 
 async def test_openai_call():

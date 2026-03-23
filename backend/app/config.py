@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # OpenRouter (OpenAI-compatible API)
     OPENROUTER_API_KEY: str
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
-    OPENAI_MODEL: str = "OpenAI: gpt-oss-120b (free)"
+    OPENAI_MODEL: str = "nvidia/nemotron-3-super-120b-a12b:free"
     OPENAI_MAX_TOKENS: int = 2000
     OPENAI_MODEL_GPT4: str = "gpt-4-turbo-preview"
     OPENAI_MODEL_GPT35: str = "gpt-3.5-turbo"

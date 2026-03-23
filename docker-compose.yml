@@ -7,14 +7,16 @@ services:
       - "7687:7687"
     environment:
       - NEO4J_AUTH=neo4j/ontology123
-      - NEO4JLABS_PLUGINS=["apoc"]
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*
     volumes:
       - neo4j_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ontology123 'RETURN 1' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
     networks:
       - ontology_network
 
@@ -64,8 +66,6 @@ services:
       - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       - NEWS_API_KEY=${NEWS_API_KEY}
     depends_on:
-      neo4j:
-        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
