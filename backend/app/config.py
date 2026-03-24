@@ -14,16 +14,16 @@ class Settings(BaseSettings):
     APP_NAME: str = "Global Ontology Engine"
     APP_VERSION: str = "1.0.0"
     ENVIRONMENT: str = "development"
-    DEBUG: bool = True
+    DEBUG: bool = False  # Changed from True for production safety
     
     # Neo4j Graph Database
     NEO4J_URI: str = "bolt://localhost:7687"
     NEO4J_USER: str = "neo4j"
-    NEO4J_PASSWORD: str = "ontology123"
+    NEO4J_PASSWORD: str  # Required, no default
     NEO4J_DATABASE: str = "neo4j"
     
     # PostgreSQL Database
-    DATABASE_URL: str = "postgresql://ontology_user:ontology123@localhost:5432/ontology_db"
+    DATABASE_URL: str  # Required, must be set via environment
     
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -109,12 +109,14 @@ class Settings(BaseSettings):
 
     @field_validator("INGESTION_INTERVAL_MINUTES", mode="before")
     @classmethod
-    def clamp_ingestion_interval(cls, value):
+    def validate_ingestion_interval(cls, value):
+        """Validate and set reasonable ingestion interval bounds"""
         try:
             numeric = int(value)
         except Exception:
-            return 5
-        return max(2, min(5, numeric))
+            return 5  # Default to 5 minutes if invalid
+        # Clamp to reasonable bounds: min 1 minute, max 60 minutes
+        return max(1, min(60, numeric))
 
     @property
     def openai_api_key(self) -> str:

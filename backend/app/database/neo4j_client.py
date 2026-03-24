@@ -1,11 +1,27 @@
 """
 Neo4j Graph Database Client
 """
+import re
 from neo4j import AsyncGraphDatabase, AsyncDriver
 from typing import Optional, List, Dict, Any
 from loguru import logger
 
 from app.config import settings
+
+
+# Validation regex for Neo4j labels and relationship types
+# Must start with letter or underscore, followed by alphanumeric or underscores
+LABEL_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def validate_label(label: str) -> bool:
+    """Validate that a label is safe for use in Cypher queries"""
+    return bool(LABEL_PATTERN.match(label))
+
+
+def validate_relationship_type(rel_type: str) -> bool:
+    """Validate that a relationship type is safe for use in Cypher queries"""
+    return bool(LABEL_PATTERN.match(rel_type))
 
 
 class Neo4jClient:
@@ -82,7 +98,7 @@ class Neo4jClient:
         parameters: Optional[Dict[str, Any]] = None,
         **kwargs: Any
     ) -> Any:
-        """Execute a write transaction"""
+        """Execute a write transaction using session.execute_write for proper leader routing"""
         params: Dict[str, Any] = {}
         if parameters:
             params.update(parameters)
@@ -92,9 +108,15 @@ class Neo4jClient:
         try:
             if not self.driver:
                 raise RuntimeError("Neo4j driver is not connected")
+            
             async with self.driver.session(database=self.database) as session:
-                result = await session.run(query, params)
-                summary = await result.consume()
+                # Use execute_write for proper leader routing and automatic retries
+                # This ensures writes are routed to the leader in a Neo4j cluster
+                async def write_transaction(tx):
+                    result = await tx.run(query, params)
+                    return await result.consume()
+                
+                summary = await session.execute_write(write_transaction)
                 return summary
         except Exception as e:
             logger.error(f"Write execution failed: {e}\nQuery: {query}")
@@ -106,8 +128,12 @@ class Neo4jClient:
         properties: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Create a node with given label and properties"""
+        # Validate label to prevent Cypher injection
+        if not validate_label(label):
+            raise ValueError(f"Invalid label format: {label}")
+        
         query = f"""
-        CREATE (n:{label} $props)
+        CREATE (n:`{label}` $props)
         RETURN n
         """
         result = await self.execute_query(query, {"props": properties})
@@ -124,10 +150,14 @@ class Neo4jClient:
         if properties is None:
             properties = {}
         
+        # Validate relationship type to prevent Cypher injection
+        if not validate_relationship_type(relationship_type):
+            raise ValueError(f"Invalid relationship type format: {relationship_type}")
+        
         query = f"""
         MATCH (a), (b)
         WHERE id(a) = $from_id AND id(b) = $to_id
-        CREATE (a)-[r:{relationship_type} $props]->(b)
+        CREATE (a)-[r:`{relationship_type}` $props]->(b)
         RETURN r
         """
         result = await self.execute_query(
@@ -143,8 +173,16 @@ class Neo4jClient:
         property_value: Any
     ) -> Optional[Dict[str, Any]]:
         """Find a node by property value"""
+        # Validate label to prevent Cypher injection
+        if not validate_label(label):
+            raise ValueError(f"Invalid label format: {label}")
+        
+        # Validate property name (column name) to prevent Cypher injection
+        if not validate_label(property_name):
+            raise ValueError(f"Invalid property name format: {property_name}")
+        
         query = f"""
-        MATCH (n:{label} {{{property_name}: $value}})
+        MATCH (n:`{label}` {{{property_name}: $value}})
         RETURN n
         """
         result = await self.execute_query(query, {"value": property_value})
@@ -167,8 +205,16 @@ class Neo4jClient:
         max_hops: int = 1
     ) -> List[Dict[str, Any]]:
         """Get nodes related to a given node"""
+        # Clamp max_hops to prevent cartesian explosion
+        max_hops = max(1, min(max_hops, 5))
+        
         if relationship_types:
-            rel_pattern = "|".join(relationship_types)
+            # Validate all relationship types to prevent Cypher injection
+            for rel_type in relationship_types:
+                if not validate_relationship_type(rel_type):
+                    raise ValueError(f"Invalid relationship type format: {rel_type}")
+            
+            rel_pattern = "|".join(f"`{rel_type}`" for rel_type in relationship_types)
             rel_query = f"[r:{rel_pattern}*1..{max_hops}]"
         else:
             rel_query = f"[r*1..{max_hops}]"

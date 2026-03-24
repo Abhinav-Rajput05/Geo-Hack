@@ -4,6 +4,7 @@ Ontology API Endpoints - Knowledge Graph Management
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
+from datetime import datetime
 from app.ontology import ontology_service
 
 router = APIRouter()
@@ -70,44 +71,59 @@ async def get_entity_types():
     """
     Get all entity types in the ontology
     """
-    return [
-        EntityType(
-            name="Country",
-            description="Nation states and territories",
-            properties=["name", "code", "region", "population", "gdp"],
-            count=195
-        ),
-        EntityType(
-            name="Organization",
-            description="International organizations, alliances, NGOs",
-            properties=["name", "type", "founded", "headquarters"],
-            count=850
-        ),
-        EntityType(
-            name="Company",
-            description="Corporations and business entities",
-            properties=["name", "industry", "revenue", "headquarters"],
-            count=2500
-        ),
-        EntityType(
-            name="Individual",
-            description="Notable persons (leaders, officials, experts)",
-            properties=["name", "role", "country", "organization"],
-            count=5000
-        ),
-        EntityType(
-            name="System",
-            description="Technological, military, or infrastructure systems",
-            properties=["name", "type", "operator", "status"],
-            count=1200
-        ),
-        EntityType(
-            name="Event",
-            description="Occurrences with temporal and spatial context",
-            properties=["title", "date", "location", "type", "severity"],
-            count=5255
-        )
-    ]
+    try:
+        # Get actual counts from the database instead of hardcoded values
+        stats = await ontology_service.get_graph_statistics()
+        entity_types_data = stats.get("entity_types", {})
+        
+        # Define type metadata
+        type_metadata = {
+            "Country": {
+                "description": "Nation states and territories",
+                "properties": ["name", "code", "region", "population", "gdp"]
+            },
+            "Organization": {
+                "description": "International organizations, alliances, NGOs",
+                "properties": ["name", "type", "founded", "headquarters"]
+            },
+            "Company": {
+                "description": "Corporations and business entities",
+                "properties": ["name", "industry", "revenue", "headquarters"]
+            },
+            "Individual": {
+                "description": "Notable persons (leaders, officials, experts)",
+                "properties": ["name", "role", "country", "organization"]
+            },
+            "System": {
+                "description": "Technological, military, or infrastructure systems",
+                "properties": ["name", "type", "operator", "status"]
+            },
+            "Event": {
+                "description": "Occurrences with temporal and spatial context",
+                "properties": ["title", "date", "location", "type", "severity"]
+            }
+        }
+        
+        # Build response with real counts
+        entity_types = []
+        for type_name, count in entity_types_data.items():
+            metadata = type_metadata.get(type_name, {
+                "description": f"Entity type: {type_name}",
+                "properties": ["name", "type"]
+            })
+            entity_types.append(EntityType(
+                name=type_name,
+                description=metadata["description"],
+                properties=metadata["properties"],
+                count=count
+            ))
+        
+        # Sort by count descending
+        entity_types.sort(key=lambda x: x.count, reverse=True)
+        return entity_types
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch entity types: {e}") from e
 
 
 @router.get("/relationship-types", response_model=List[RelationshipType])
@@ -180,20 +196,23 @@ async def get_entity(entity_id: str):
     """
     Get a specific entity by ID
     """
-    # TODO: Implement entity retrieval from Neo4j
-    return Entity(
-        id=entity_id,
-        name="United States",
-        type="Country",
-        properties={
-            "code": "USA",
-            "region": "North America",
-            "population": 331000000,
-            "gdp": 25.5
-        },
-        relationships_count=125,
-        last_updated="2024-01-15T10:30:00Z"
-    )
+    try:
+        entity = await ontology_service.get_entity(entity_id)
+        if not entity:
+            raise HTTPException(status_code=404, detail=f"Entity not found: {entity_id}")
+        
+        return Entity(
+            id=entity_id,
+            name=entity.get("name", "Unknown"),
+            type=entity.get("type", "Unknown"),
+            properties=entity.get("properties", {}),
+            relationships_count=entity.get("relationships_count", 0),
+            last_updated=entity.get("updated_at", datetime.utcnow().isoformat()),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch entity: {e}") from e
 
 
 @router.get("/entities/{entity_id}/relationships")
@@ -206,25 +225,20 @@ async def get_entity_relationships(
     """
     Get relationships for a specific entity
     """
-    # TODO: Implement relationship retrieval
-    return {
-        "entity_id": entity_id,
-        "relationships": [
-            {
-                "type": "alliesWith",
-                "direction": "outgoing",
-                "target": {"id": "ent_002", "name": "United Kingdom", "type": "Country"},
-                "properties": {"since": "1949", "type": "NATO"}
-            },
-            {
-                "type": "tradesWith",
-                "direction": "outgoing",
-                "target": {"id": "ent_003", "name": "China", "type": "Country"},
-                "properties": {"volume": 658, "goods": ["electronics", "agriculture"]}
-            }
-        ],
-        "total": 2
-    }
+    try:
+        relationships = await ontology_service.get_relationships(
+            entity_id,
+            relationship_type=relationship_type,
+            direction=direction,
+            limit=limit
+        )
+        return {
+            "entity_id": entity_id,
+            "relationships": relationships,
+            "total": len(relationships)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch relationships: {e}") from e
 
 
 @router.get("/search")
@@ -236,15 +250,19 @@ async def search_entities(
     """
     Search entities in the knowledge graph
     """
-    # TODO: Implement entity search
-    return {
-        "query": query,
-        "results": [
-            {"id": "ent_001", "name": "United States", "type": "Country", "score": 0.95},
-            {"id": "ent_002", "name": "United Kingdom", "type": "Country", "score": 0.85}
-        ],
-        "total": 2
-    }
+    try:
+        results = await ontology_service.search_entities(
+            query=query,
+            entity_type=entity_type,
+            limit=limit
+        )
+        return {
+            "query": query,
+            "results": results,
+            "total": len(results)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to search entities: {e}") from e
 
 
 @router.get("/graph/{entity_id}/subgraph")
@@ -256,17 +274,19 @@ async def get_entity_subgraph(
     """
     Get a subgraph centered on an entity for visualization
     """
-    # TODO: Implement subgraph retrieval
-    return {
-        "center": {"id": entity_id, "name": "United States", "type": "Country"},
-        "nodes": [
-            {"id": "ent_001", "name": "United States", "type": "Country"},
-            {"id": "ent_002", "name": "United Kingdom", "type": "Country"},
-            {"id": "ent_003", "name": "China", "type": "Country"}
-        ],
-        "edges": [
-            {"source": "ent_001", "target": "ent_002", "type": "alliesWith"},
-            {"source": "ent_001", "target": "ent_003", "type": "tradesWith"}
-        ],
-        "depth": depth
-    }
+    try:
+        # Clamp depth to prevent performance issues
+        clamped_depth = max(1, min(depth, 5))
+        subgraph = await ontology_service.get_entity_subgraph(
+            entity_id,
+            depth=clamped_depth,
+            limit=limit
+        )
+        return {
+            "center": subgraph.get("center", {"id": entity_id}),
+            "nodes": subgraph.get("nodes", []),
+            "edges": subgraph.get("edges", []),
+            "depth": clamped_depth
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch subgraph: {e}") from e

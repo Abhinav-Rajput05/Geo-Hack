@@ -59,32 +59,62 @@ class OntologyService:
         limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Search entities by name or type"""
-        cypher = """
-        MATCH (e:Entity)
-        WHERE e.name CONTAINS $query
-        """
-        if entity_type:
-            cypher += " AND e.type = $entity_type"
         
-        cypher += """
-        RETURN e, id(e) as node_id
-        ORDER BY e.name
+        # Fixed entity_type parameter handling - only include when provided (Medium #22)
+        params = {"query": query, "limit": limit}
+        if entity_type:
+            params["entity_type"] = entity_type
+        
+        # Try full-text index first (Medium #19), fallback to CONTAINS if index doesn't exist
+        cypher = """
+        // Try full-text index first
+        CALL db.index.fulltext.queryNodes('entity_name_ft', $query + '*') YIELD node, score
+        WHERE ($entity_type IS NULL OR node.type = $entity_type)
+        RETURN node as e, id(node) as node_id, score
+        ORDER BY score DESC
         LIMIT $limit
         """
         
-        results = await self.neo4j.execute_query(
-            cypher, 
-            parameters={
-                "query": query,
-                "entity_type": entity_type,
-                "limit": limit
-            }
-        )
+        try:
+            results = await self.neo4j.execute_query(cypher, parameters=params)
+            
+            # If full-text index doesn't exist, fall back to CONTAINS query
+            if not results:
+                cypher = """
+                MATCH (e:Entity)
+                WHERE e.name CONTAINS $query
+                """
+                if entity_type:
+                    cypher += " AND e.type = $entity_type"
+                
+                cypher += """
+                RETURN e, id(e) as node_id
+                ORDER BY e.name
+                LIMIT $limit
+                """
+                results = await self.neo4j.execute_query(cypher, parameters=params)
+        except Exception:
+            # Full-text index not available, use CONTAINS fallback
+            cypher = """
+            MATCH (e:Entity)
+            WHERE e.name CONTAINS $query
+            """
+            if entity_type:
+                cypher += " AND e.type = $entity_type"
+            
+            cypher += """
+            RETURN e, id(e) as node_id
+            ORDER BY e.name
+            LIMIT $limit
+            """
+            results = await self.neo4j.execute_query(cypher, parameters=params)
         
         entities = []
         for row in results:
             entity = dict(row['e'])
             entity['id'] = str(row['node_id'])
+            if 'score' in row:
+                entity['score'] = row['score']
             entities.append(entity)
         
         return entities
@@ -126,6 +156,7 @@ class OntologyService:
         entity_match = "(toString(id(e)) = $entity_id OR e.name = $entity_id)"
         rel_filter = " AND r.type = $relationship_type" if relationship_type else ""
 
+        # Fixed UNION query to apply LIMIT to both branches (Medium #18)
         if direction == "outgoing":
             query = f"""
             MATCH (e:Entity)-[r]->(target:Entity)
@@ -141,10 +172,12 @@ class OntologyService:
             LIMIT $limit
             """
         else:
+            # Fix: Apply LIMIT to both UNION branches
             query = f"""
             MATCH (e:Entity)-[r]->(target:Entity)
             WHERE {entity_match}{rel_filter}
             RETURN e as source, r, target, id(r) as rel_id
+            LIMIT $limit
             UNION
             MATCH (source:Entity)-[r]->(e:Entity)
             WHERE {entity_match}{rel_filter}
@@ -152,6 +185,7 @@ class OntologyService:
             LIMIT $limit
             """
 
+        # Fixed parameter handling - only include entity_type when provided (Medium #22)
         params = {
             "entity_id": str(entity_id),
             "limit": limit,
@@ -182,33 +216,40 @@ class OntologyService:
     ) -> Dict[str, Any]:
         """Get a subgraph centered on an entity for visualization"""
         
+        # Clamp depth to prevent performance issues (Medium #16)
+        clamped_depth = max(1, min(int(depth), 5))
+        
+        # Validate depth is a positive integer
+        if clamped_depth < 1:
+            raise ValueError("Depth must be a positive integer")
+        
         # Get connected nodes at specified depth
-        query = f"""
-        MATCH path = (e:Entity)-[r*1..{depth}]->(connected)
+        query = """
+        MATCH path = (e:Entity)-[r*1..$depth]->(connected)
         WHERE toString(id(e)) = $entity_id OR e.name = $entity_id
         WITH nodes(path) as nodes, relationships(path) as rels
         UNWIND nodes as n
         UNWIND rels as r
         WITH DISTINCT n, r
-        RETURN collect(DISTINCT {{
+        RETURN collect(DISTINCT {
             id: id(n),
             name: n.name,
             type: n.type,
             properties: properties(n)
-        }}) as nodes,
-        collect(DISTINCT {{
+        }) as nodes,
+        collect(DISTINCT {
             source: id(startNode(r)),
             target: id(endNode(r)),
             type: type(r),
             properties: properties(r)
-        }}) as edges
+        }) as edges
         LIMIT 1
         """
         
         result = await self.neo4j.execute_query(
             query,
             entity_id=str(entity_id),
-            depth=depth,
+            depth=clamped_depth,
             limit=limit
         )
         

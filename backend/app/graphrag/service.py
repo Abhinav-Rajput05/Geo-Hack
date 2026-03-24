@@ -19,6 +19,10 @@ class GraphRAGService:
         self.client = AsyncOpenAI(
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
+            default_headers={
+                "HTTP-Referer": "https://github.com/Geo-Hack",
+                "X-Title": "Global Ontology Engine",
+            }
         )
         self.model = settings.openai_model
         self.top_k = settings.graphrag_top_k
@@ -159,11 +163,9 @@ Example output: ["United States", "NATO", "China"]"""
                 }
             )
 
-        if vector_texts:
-            try:
-                await chroma_service.add_documents(vector_texts, vector_metadata)
-            except Exception:
-                pass
+        # NOTE: Removed the write to chroma_service here - vector store should only be 
+        # written during ingestion, not during query time. This prevents pollution of
+        # the embedding space and unbounded growth of in-memory docs.
 
         return {
             "entities": all_entities[:20],  # Limit context size

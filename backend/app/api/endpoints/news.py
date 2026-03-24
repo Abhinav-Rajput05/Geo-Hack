@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional
 from uuid import uuid4
 
 from dateutil import parser as date_parser
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from loguru import logger
 from pydantic import BaseModel
 
@@ -14,6 +14,7 @@ from app.config import settings
 from app.database.redis_client import redis_client
 from app.ingestion.news_ingestor import news_ingestor
 from app.vectorstore import chroma_service
+from app.main import limiter
 
 router = APIRouter()
 
@@ -123,7 +124,8 @@ async def get_ingestion_status():
 
 
 @router.post("/ingestion/trigger")
-async def trigger_ingestion():
+@limiter.limit("5/minute")  # Rate limit expensive ingestion triggers
+async def trigger_ingestion(request: Request):
     """
     Manually trigger news ingestion
     """
@@ -142,7 +144,9 @@ async def trigger_ingestion():
 
 
 @router.post("/trigger-ingestion")
+@limiter.limit("2/minute")  # Rate limit debug endpoint even more strictly
 async def trigger_ingestion_debug(
+    request: Request,
     limit_per_source: int = 5,
     keywords: Optional[str] = None,
     country: Optional[str] = None,

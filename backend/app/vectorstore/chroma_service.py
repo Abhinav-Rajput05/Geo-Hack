@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import uuid
 from typing import Any, Dict, List, Optional
+from collections import deque
 
 from openai import AsyncOpenAI
 
@@ -15,6 +16,10 @@ try:
     import chromadb  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     chromadb = None
+
+
+# Maximum size for in-memory fallback to prevent unbounded memory growth
+MAX_IN_MEMORY_DOCS = 1000
 
 
 class ChromaService:
@@ -63,15 +68,23 @@ class ChromaService:
             except Exception:
                 pass
 
+        # Add to in-memory fallback with LRU eviction
         for idx, text in enumerate(texts):
-            self._in_memory_docs.append(
-                {
-                    "id": ids[idx],
-                    "text": text,
-                    "metadata": metadatas[idx] if idx < len(metadatas) else {},
-                    "embedding": embeddings[idx],
-                }
-            )
+            new_doc = {
+                "id": ids[idx],
+                "text": text,
+                "metadata": metadatas[idx] if idx < len(metadatas) else {},
+                "embedding": embeddings[idx],
+            }
+            
+            # Simple LRU: if at capacity, remove oldest entries
+            if len(self._in_memory_docs) >= MAX_IN_MEMORY_DOCS:
+                # Remove oldest 10% of entries when at capacity
+                remove_count = max(1, MAX_IN_MEMORY_DOCS // 10)
+                self._in_memory_docs = self._in_memory_docs[remove_count:]
+            
+            self._in_memory_docs.append(new_doc)
+        
         return len(texts)
 
     async def similarity_search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:

@@ -28,6 +28,23 @@ class InsightsService:
         {"name": "Social", "key": "social", "entity_type": "Individual"},
     ]
     
+    # Cache for expensive operations to prevent N+1 queries on every request
+    _cache: Dict[str, Any] = {}
+    _cache_ttl: int = 300  # 5 minutes cache TTL
+    _last_cache_update: Optional[datetime] = None
+    
+    def _is_cache_valid(self) -> bool:
+        """Check if cache is still valid"""
+        if self._last_cache_update is None:
+            return False
+        age = (datetime.utcnow() - self._last_cache_update).total_seconds()
+        return age < self._cache_ttl
+    
+    def _invalidate_cache(self) -> None:
+        """Invalidate all caches"""
+        self._cache.clear()
+        self._last_cache_update = None
+    
     async def get_risk_analysis(
         self, 
         category: Optional[str] = None,
@@ -35,18 +52,29 @@ class InsightsService:
     ) -> Dict[str, Any]:
         """Get risk analysis by category and/or region"""
         
+        # Use cache to prevent N+1 queries on every request
+        cache_key = f"risk_analysis_{category}_{region}"
+        if cache_key in self._cache and self._is_cache_valid():
+            return self._cache[cache_key]
+        
         # Calculate risk scores based on entity relationships
         risk_scores = await self._calculate_risk_scores(category, region)
         
         # Get trends
         trends = await self._calculate_trends(risk_scores)
         
-        return {
+        result = {
             'overall_risk': self._calculate_overall_risk(risk_scores),
             'categories': risk_scores,
             'trends': trends,
             'last_updated': datetime.utcnow().isoformat(),
         }
+        
+        # Cache the result
+        self._cache[cache_key] = result
+        self._last_cache_update = datetime.utcnow()
+        
+        return result
     
     async def _calculate_risk_scores(
         self, 
@@ -152,6 +180,11 @@ class InsightsService:
     
     async def get_map_data(self) -> Dict[str, Any]:
         """Get country impact data for world map visualization"""
+        # Use cache to prevent N+1 queries on every request
+        cache_key = "map_data"
+        if cache_key in self._cache and self._is_cache_valid():
+            return self._cache[cache_key]
+        
         countries = await ontology_service.search_entities(
             query="",
             entity_type="Country",
@@ -180,10 +213,16 @@ class InsightsService:
                 }
             )
         
-        return {
+        result = {
             'countries': country_impacts,
             'last_updated': datetime.utcnow().isoformat(),
         }
+        
+        # Cache the result
+        self._cache[cache_key] = result
+        self._last_cache_update = datetime.utcnow()
+        
+        return result
     
     async def get_country_risk(self, country_code: str) -> Dict[str, Any]:
         """Get detailed risk analysis for a specific country"""
@@ -259,6 +298,11 @@ class InsightsService:
         }
 
     async def _estimate_category_centrality(self, entity_type: str) -> float:
+        # Cache centrality calculations to prevent N+1 queries
+        cache_key = f"centrality_{entity_type}"
+        if cache_key in self._cache and self._is_cache_valid():
+            return self._cache[cache_key]
+        
         entities = await ontology_service.search_entities(
             query="",
             entity_type=entity_type,
@@ -280,13 +324,23 @@ class InsightsService:
             relationship_total += len(rels)
 
         avg_degree = relationship_total / max(len(entities), 1)
-        return min(avg_degree / 30.0, 1.0)
+        centrality = min(avg_degree / 30.0, 1.0)
+        
+        # Cache the centrality value
+        self._cache[cache_key] = centrality
+        
+        return centrality
 
     async def _estimate_recent_event_frequency(
         self,
         domain_key: str,
         related_entities: Optional[List[Dict[str, Any]]] = None
     ) -> float:
+        # Cache event frequency calculations
+        cache_key = f"event_freq_{domain_key}"
+        if cache_key in self._cache and self._is_cache_valid():
+            return self._cache[cache_key]
+        
         now = datetime.utcnow()
         threshold = now - timedelta(days=14)
 
@@ -325,9 +379,14 @@ class InsightsService:
             except Exception:
                 continue
 
-        if relevant_count == 0:
-            return 0.0
-        return min(recent_count / relevant_count, 1.0)
+        frequency = 0.0
+        if relevant_count > 0:
+            frequency = min(recent_count / relevant_count, 1.0)
+        
+        # Cache the frequency value
+        self._cache[cache_key] = frequency
+        
+        return frequency
 
 
 # Singleton instance

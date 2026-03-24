@@ -3,7 +3,9 @@ NLP Service - Entity Extraction, Relation Extraction, and Sentiment Analysis
 """
 import json
 from typing import List, Dict, Any, Optional
+from datetime import datetime
 from openai import AsyncOpenAI
+from loguru import logger
 from app.config import settings
 
 try:
@@ -81,7 +83,7 @@ Expected output format:
             return base_entities
             
         except Exception as e:
-            print(f"Error extracting entities: {e}")
+            logger.error(f"Error extracting entities: {e}")
             return base_entities
     
     async def extract_relations(
@@ -132,7 +134,7 @@ Expected output format:
             return relations if isinstance(relations, list) else []
             
         except Exception as e:
-            print(f"Error extracting relations: {e}")
+            logger.error(f"Error extracting relations: {e}")
             return []
     
     async def analyze_sentiment(self, text: str) -> Dict[str, Any]:
@@ -163,7 +165,7 @@ Text:
             return json.loads(content)
             
         except Exception as e:
-            print(f"Error analyzing sentiment: {e}")
+            logger.error(f"Error analyzing sentiment: {e}")
             return {"sentiment": "neutral", "score": 0.0, "confidence": 0.0}
     
     async def process_article(
@@ -188,7 +190,7 @@ Text:
             'entities': entities,
             'relations': relations,
             'sentiment': sentiment,
-            'processed_at': 'timestamp',
+            'processed_at': datetime.utcnow().isoformat(),
         }
     
     async def generate_embedding(self, text: str) -> List[float]:
@@ -201,7 +203,7 @@ Text:
             )
             return response.data[0].embedding
         except Exception as e:
-            print(f"Error generating embedding: {e}")
+            logger.error(f"Error generating embedding: {e}")
             return []
 
     def _extract_entities_spacy(self, text: str) -> List[Dict[str, Any]]:

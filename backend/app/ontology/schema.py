@@ -193,9 +193,21 @@ RISK_CATEGORIES = [
 ]
 
 # Impact levels for world map visualization
+def get_impact_level(score: float) -> str:
+    """Get impact level from score (0-100)"""
+    if score <= 30:
+        return "low"
+    elif score <= 60:
+        return "medium"
+    elif score <= 80:
+        return "high"
+    else:
+        return "critical"
+
+# Backward compatibility - deprecated, use get_impact_level() instead
 IMPACT_LEVELS = {
-    0-30: "low",
-    31-60: "medium", 
-    61-80: "high",
-    81-100: "critical",
+    (0, 30): "low",
+    (31, 60): "medium",
+    (61, 80): "high",
+    (81, 100): "critical",
 }

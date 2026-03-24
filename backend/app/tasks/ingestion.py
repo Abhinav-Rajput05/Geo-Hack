@@ -1,9 +1,9 @@
 """
 News Ingestion Tasks
 """
-import asyncio
 from typing import Dict, Any, List, Optional
 from loguru import logger
+from asgiref.sync import async_to_sync
 
 from app.tasks.celery_app import celery_app
 from app.ingestion.news_ingestor import news_ingestor
@@ -21,13 +21,13 @@ def ingest_news(
     """
     logger.info(f"Celery ingestion task started (limit={limit})")
     try:
-        result = asyncio.run(
-            news_ingestor.ingest_all(
-                limit_per_source=limit,
-                keywords=keywords,
-                country=country,
-                category=category,
-            )
+        # Use async_to_sync instead of asyncio.run() to properly handle async code
+        # from a synchronous Celery task without event loop conflicts
+        result = async_to_sync(news_ingestor.ingest_all)(
+            limit_per_source=limit,
+            keywords=keywords,
+            country=country,
+            category=category,
         )
         logger.info(
             "Celery ingestion task completed: "

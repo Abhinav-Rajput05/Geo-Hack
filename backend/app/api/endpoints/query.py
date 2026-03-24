@@ -1,7 +1,7 @@
 """
 Query API Endpoints - GraphRAG Question Answering
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from time import perf_counter
@@ -9,6 +9,7 @@ from time import perf_counter
 from app.graphrag import graphrag_service
 from app.insights import insights_service
 from app.ontology import ontology_service
+from app.main import limiter
 
 router = APIRouter()
 
@@ -19,6 +20,8 @@ class QueryRequest(BaseModel):
     domain: Optional[str] = None  # geopolitics, economics, defense, technology, climate, society
     max_hops: Optional[int] = 3
     include_sources: Optional[bool] = True
+    include_map_data: Optional[bool] = False  # Optional, expensive operation
+    include_risk_analysis: Optional[bool] = False  # Optional, expensive operation
 
 
 class EntityReference(BaseModel):
@@ -50,22 +53,32 @@ class QueryResponse(BaseModel):
 
 
 @router.post("", response_model=QueryResponse)
-async def query_ontology(request: QueryRequest):
+@limiter.limit("10/minute")  # Rate limit expensive GraphRAG queries
+async def query_ontology(request: Request, query_request: QueryRequest):
     """
     Query the knowledge graph using GraphRAG
     
     This endpoint processes natural language questions and returns:
     - Comprehensive answer with detailed explanation
     - Related entities and relationships
-    - Country-wise impact data for map visualization
-    - Risk analysis with severity levels
+    - Country-wise impact data for map visualization (optional, expensive)
+    - Risk analysis with severity levels (optional, expensive)
     - Source citations
     """
     started = perf_counter()
     try:
-        rag_result = await graphrag_service.query(request.question)
-        map_data = await insights_service.get_map_data()
-        risk_data = await insights_service.get_risk_analysis(category=request.domain)
+        rag_result = await graphrag_service.query(query_request.question)
+        
+        # Only fetch expensive operations when explicitly requested
+        map_data = None
+        risk_data = None
+        
+        if query_request.include_map_data:
+            map_data = await insights_service.get_map_data()
+            
+        if query_request.include_risk_analysis:
+            risk_data = await insights_service.get_risk_analysis(category=query_request.domain)
+            
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query processing failed: {e}") from e
 
@@ -98,7 +111,7 @@ async def query_ontology(request: QueryRequest):
     elapsed_ms = (perf_counter() - started) * 1000
 
     return QueryResponse(
-        question=request.question,
+        question=query_request.question,
         answer=rag_result.get("answer", "No answer available"),
         explanation=AnswerExplanation(
             reasoning_chain=rag_result.get("reasoning_chain", []),
