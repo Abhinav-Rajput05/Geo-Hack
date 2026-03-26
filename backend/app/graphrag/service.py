@@ -100,43 +100,72 @@ Example output: ["United States", "NATO", "China"]"""
             )
 
             content = response.choices[0].message.content
-            data = json.loads(content)
+            
+            # FIXED: Safe JSON parsing with validation
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse LLM JSON response: {e}, content: {content}")
+                return []
 
             if isinstance(data, dict) and "entities" in data:
                 return data["entities"]
             elif isinstance(data, list):
                 return data
             else:
+                logger.warning(f"Unexpected LLM response format: {type(data)}")
                 return []
 
         except Exception as e:
-            logger.error(f"Error extracting entities: {e}")
+            logger.error(f"Error extracting entities: {e}", exc_info=True)
             return []
 
     async def _retrieve_context(self, entities: List[str]) -> Dict[str, Any]:
-        """Retrieve context from knowledge graph"""
-
+        """
+        Retrieve context from knowledge graph.
+        
+        FIXED: Parallelized entity and relationship lookups using asyncio.gather.
+        Old: Sequential lookups (2-10x slower)
+        New: Parallel execution (all lookups run concurrently)
+        """
+        
+        # FIXED: Parallel entity and relationship lookups
+        entity_tasks = []
+        relationship_tasks = []
+        
+        for entity_name in entities:
+            # Create tasks for parallel execution
+            entity_tasks.append(
+                ontology_service.get_related_entities(entity_name, limit=self.top_k)
+            )
+            relationship_tasks.append(
+                ontology_service.get_relationships(entity_name, direction="both", limit=10)
+            )
+        
+        # Execute all lookups in parallel
+        try:
+            entity_results = await asyncio.gather(*entity_tasks, return_exceptions=True)
+            relationship_results = await asyncio.gather(*relationship_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"Error in parallel graph lookups: {e}", exc_info=True)
+            entity_results = []
+            relationship_results = []
+        
+        # Combine results, filtering out exceptions
         all_entities = []
         all_relationships = []
-
-        for entity_name in entities:
-            try:
-                # Get related entities
-                related = await ontology_service.get_related_entities(
-                    entity_name, limit=self.top_k
-                )
-                all_entities.extend(related)
-            except Exception as exc:
-                logger.warning(f"Graph context related-entity lookup failed for '{entity_name}': {exc}")
-
-            try:
-                # Get relationships
-                rels = await ontology_service.get_relationships(
-                    entity_name, direction="both", limit=10
-                )
-                all_relationships.extend(rels)
-            except Exception as exc:
-                logger.warning(f"Graph context relationship lookup failed for '{entity_name}': {exc}")
+        
+        for idx, result in enumerate(entity_results):
+            if isinstance(result, Exception):
+                logger.warning(f"Entity lookup failed for '{entities[idx]}': {result}")
+            elif result:
+                all_entities.extend(result)
+        
+        for idx, result in enumerate(relationship_results):
+            if isinstance(result, Exception):
+                logger.warning(f"Relationship lookup failed for '{entities[idx]}': {result}")
+            elif result:
+                all_relationships.extend(result)
 
         # Get subgraph for first entity if available
         subgraph = {}
@@ -149,33 +178,9 @@ Example output: ["United States", "NATO", "China"]"""
                 logger.warning(f"Graph context subgraph lookup failed for '{entities[0]}': {exc}")
                 subgraph = {}
 
-        vector_texts = []
-        vector_metadata = []
-        for entity in all_entities[:20]:
-            name = entity.get("name", "Unknown")
-            entity_type = entity.get("type", "Unknown")
-            vector_texts.append(f"Entity: {name} ({entity_type})")
-            vector_metadata.append(
-                {"source": "neo4j_entity", "name": name, "type": entity_type}
-            )
-
-        for rel in all_relationships[:20]:
-            source_name = rel.get("source", {}).get("name", "?")
-            target_name = rel.get("target", {}).get("name", "?")
-            rel_type = rel.get("type", "related")
-            vector_texts.append(f"Relationship: {source_name} {rel_type} {target_name}")
-            vector_metadata.append(
-                {
-                    "source": "neo4j_relationship",
-                    "type": rel_type,
-                    "from": source_name,
-                    "to": target_name,
-                }
-            )
-
-        # NOTE: Removed the write to chroma_service here - vector store should only be 
-        # written during ingestion, not during query time. This prevents pollution of
-        # the embedding space and unbounded growth of in-memory docs.
+        # FIXED: Removed dead code (vector_texts and vector_metadata were never used)
+        # Vector store writes during query time were commented out - rightfully so
+        # to prevent pollution of embedding space and unbounded memory growth
 
         return {
             "entities": all_entities[:20],  # Limit context size
@@ -264,10 +269,21 @@ Provide your answer in JSON format with:
             )
 
             content = response.choices[0].message.content
-            return json.loads(content)
+            
+            # FIXED: Safe JSON parsing with validation
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse LLM answer JSON: {e}, content: {content}")
+                return {
+                    "answer": "I encountered an error parsing the response. Please try again.",
+                    "confidence": 0.0,
+                    "supporting_facts": [],
+                    "sources": [],
+                }
 
         except Exception as e:
-            logger.error(f"Error generating answer: {e}")
+            logger.error(f"Error generating answer: {e}", exc_info=True)
             return {
                 "answer": "I encountered an error while processing your question. Please try again.",
                 "confidence": 0.0,

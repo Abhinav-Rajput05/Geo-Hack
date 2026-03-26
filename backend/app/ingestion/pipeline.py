@@ -84,11 +84,14 @@ class IngestionPipeline:
                     api_articles.extend(gnews_rows)
 
             merged_articles = rss_articles + api_articles
+            
+            # FIXED: Generate IDs BEFORE deduplication to prevent race condition
+            # Use same hash logic as deduplicator to ensure consistency
+            for article in merged_articles:
+                article["id"] = self._build_article_hash(article.get("title", ""), article.get("url", ""))
+            
             unique_articles, dedup_metrics = await self.deduplicator.deduplicate(merged_articles)
             logger.info("[INFO] Deduplicated: %s removed", dedup_metrics.get("removed_total", 0))
-
-            for article in unique_articles:
-                article["id"] = self._build_article_hash(article.get("title", ""), article.get("url", ""))
 
             normalized_articles = self.news_ingestor.normalize_articles(unique_articles)
             enriched_articles = await self._enrich_articles(normalized_articles)

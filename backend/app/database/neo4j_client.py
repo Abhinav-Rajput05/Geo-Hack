@@ -35,16 +35,29 @@ class Neo4jClient:
         self.database = settings.NEO4J_DATABASE
     
     async def connect(self) -> None:
-        """Establish connection to Neo4j database"""
+        """
+        Establish connection to Neo4j database with optimized connection pooling.
+        
+        FIXED: Added connection pool configuration for production load:
+        - max_connection_pool_size: 100 (default is 100, making it explicit)
+        - connection_acquisition_timeout: 60s (prevent hanging)
+        - max_connection_lifetime: 1 hour (recycle connections)
+        - connection_timeout: 30s (fail fast on network issues)
+        """
         try:
             self.driver = AsyncGraphDatabase.driver(
                 self.uri,
-                auth=(self.user, self.password)
+                auth=(self.user, self.password),
+                max_connection_pool_size=100,  # Handle concurrent requests
+                connection_acquisition_timeout=60.0,  # Max wait for connection
+                max_connection_lifetime=3600,  # Recycle after 1 hour
+                connection_timeout=30.0,  # Network timeout
+                keep_alive=True,  # Maintain connections
             )
             # Verify connection
             async with self.driver.session(database=self.database) as session:
                 await session.run("RETURN 1")
-            logger.info(f"Connected to Neo4j at {self.uri}")
+            logger.info(f"Connected to Neo4j at {self.uri} (pool_size=100)")
         except Exception as e:
             logger.error(f"Failed to connect to Neo4j: {e}")
             raise

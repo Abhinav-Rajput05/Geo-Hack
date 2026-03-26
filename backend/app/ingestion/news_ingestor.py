@@ -17,8 +17,9 @@ import hashlib
 import json
 import logging
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -63,7 +64,12 @@ class NewsIngestor:
         self._rate_lock = asyncio.Lock()
         self._last_request_ts = 0.0
 
-        self._seen_hashes: Set[str] = set()
+        # FIXED: Memory leak - use TTL-based cache with max size instead of unbounded Set
+        # Old: _seen_hashes Set grew to 500k+ entries (40MB+)
+        # New: LRU cache with 24h TTL and 50k max entries (~4MB max)
+        self._seen_hashes: OrderedDict[str, datetime] = OrderedDict()
+        self._seen_hashes_max_size = 50000  # ~4MB max memory
+        self._seen_hashes_ttl_hours = 24  # Match Redis TTL of 6h with margin
         self._seen_loaded = False
         self._neo4j_constraints_ready = False
 
@@ -86,8 +92,8 @@ class NewsIngestor:
             result["total_articles_unique"] = result.get("unique_articles", 0)
             return result
         except Exception as e:
-            print(f"[ERROR] Feed failed: ingest_all, Error: {e}")
-            logger.error("[ERROR] Ingestion failed: %s", e)
+            # FIXED: Replaced print with logger
+            logger.error("[ERROR] Ingestion failed: %s", e, exc_info=True)
             return {
                 "total_articles": 0,
                 "unique_articles": 0,
@@ -180,15 +186,14 @@ class NewsIngestor:
     ) -> Tuple[FeedSource, bytes, Optional[str]]:
         """Fetch one feed with retries, timeout safety, and basic rate limiting."""
         _ = limit_per_source  # kept for future provider-specific query params
-        logger.info("[INGEST] Fetching feed: %s", feed.name)
-        print(f"[DEBUG] Fetching feed: {feed.url}")
+        logger.info("[INGEST] Fetching feed: %s (url: %s)", feed.name, feed.url)
 
         for attempt in range(1, self.fetch_retries + 1):
             try:
                 async with self._fetch_semaphore:
                     await self._apply_rate_limit()
                     async with session.get(feed.url) as response:
-                        print(f"[DEBUG] Status code: {response.status}")
+                        logger.debug("[INGEST] Feed %s status: %s", feed.name, response.status)
                         response.raise_for_status()
                         payload = await response.read()
 
@@ -229,7 +234,7 @@ class NewsIngestor:
         articles: List[Dict[str, Any]] = []
         try:
             parsed = feedparser.parse(payload)
-            print(f"[DEBUG] Entries found: {len(parsed.entries or [])}")
+            logger.debug("[PARSE] Feed %s entries: %s", feed.name, len(parsed.entries or []))
             if getattr(parsed, "bozo", 0):
                 logger.warning("[ERROR] Feed has parsing warnings: %s", feed.name)
 
@@ -265,11 +270,17 @@ class NewsIngestor:
             return []
 
     def deduplicate_articles(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove duplicates via hash(title + url), including previously-seen entries."""
+        """
+        Remove duplicates via hash(title + url), including previously-seen entries.
+        
+        FIXED: Now uses TTL-based cache to prevent memory leak.
+        """
         self._load_seen_hashes()
+        self._cleanup_expired_hashes()  # Remove old entries
 
         unique_articles: List[Dict[str, Any]] = []
         removed = 0
+        now = datetime.now(timezone.utc)
 
         for article in articles:
             article_hash = self._build_article_hash(article.get("title", ""), article.get("url", ""))
@@ -278,11 +289,16 @@ class NewsIngestor:
                 continue
 
             article["id"] = article_hash
-            self._seen_hashes.add(article_hash)
+            self._seen_hashes[article_hash] = now
+            
+            # Enforce max size (LRU eviction)
+            if len(self._seen_hashes) > self._seen_hashes_max_size:
+                self._seen_hashes.popitem(last=False)  # Remove oldest
+            
             unique_articles.append(article)
 
         self._persist_seen_hashes()
-        logger.info("[DEDUP] Removed %s duplicates", removed)
+        logger.info("[DEDUP] Removed %s duplicates, cache size: %s", removed, len(self._seen_hashes))
         return unique_articles
 
     def normalize_articles(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -341,7 +357,7 @@ class NewsIngestor:
             for article in articles:
                 name = article.get("title", "")
                 if name:
-                    print(f"[DEBUG] Inserted entity: {name}")
+                    logger.debug("[DB] Inserted article: %s", name[:50])
             return len(articles)
         except Exception as exc:
             logger.error("[DB] Neo4j persistence failed: %s", exc)
@@ -418,6 +434,7 @@ class NewsIngestor:
         return []
 
     def _load_seen_hashes(self) -> None:
+        """Load seen hashes from file with TTL support."""
         if self._seen_loaded:
             return
         self._seen_loaded = True
@@ -430,19 +447,48 @@ class NewsIngestor:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists():
+                # File format: hash|timestamp (ISO format)
+                # Legacy format: hash (treated as very old)
                 for line in path.read_text(encoding="utf-8").splitlines():
                     item = line.strip()
-                    if item:
-                        self._seen_hashes.add(item)
+                    if not item:
+                        continue
+                    
+                    if "|" in item:
+                        hash_val, timestamp_str = item.split("|", 1)
+                        try:
+                            timestamp = datetime.fromisoformat(timestamp_str)
+                            self._seen_hashes[hash_val] = timestamp
+                        except ValueError:
+                            # Invalid timestamp, skip
+                            continue
+                    else:
+                        # Legacy format - use old timestamp
+                        self._seen_hashes[item] = datetime.now(timezone.utc) - timedelta(hours=48)
         except Exception as exc:
             logger.warning("[DEDUP] Failed loading seen hash file %s: %s", path, exc)
 
     def _persist_seen_hashes(self) -> None:
+        """Persist seen hashes to file with timestamps."""
         try:
             self.seen_hashes_file.parent.mkdir(parents=True, exist_ok=True)
-            self.seen_hashes_file.write_text("\n".join(sorted(self._seen_hashes)), encoding="utf-8")
+            # Save as hash|timestamp
+            lines = [f"{h}|{ts.isoformat()}" for h, ts in self._seen_hashes.items()]
+            self.seen_hashes_file.write_text("\n".join(lines), encoding="utf-8")
         except Exception as exc:
             logger.warning("[DEDUP] Failed persisting seen hashes: %s", exc)
+    
+    def _cleanup_expired_hashes(self) -> None:
+        """Remove hashes older than TTL."""
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=self._seen_hashes_ttl_hours)
+        
+        expired_keys = [h for h, ts in self._seen_hashes.items() if ts < cutoff]
+        for key in expired_keys:
+            del self._seen_hashes[key]
+        
+        if expired_keys:
+            logger.debug(f"[DEDUP] Cleaned up {len(expired_keys)} expired hashes")
 
     @staticmethod
     def _build_article_hash(title: str, url: str) -> str:

@@ -83,7 +83,12 @@ class Settings(BaseSettings):
     
     # API Settings
     API_PREFIX: str = "/api/v1"
-    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    CORS_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
 
     @field_validator("DEBUG", mode="before")
     @classmethod
@@ -106,11 +111,21 @@ class Settings(BaseSettings):
         if isinstance(value, list):
             return value
         if value is None:
-            return ["http://localhost:3000", "http://127.0.0.1:3000"]
+            return [
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+            ]
         value_str = str(value).strip()
         if "," in value_str:
             return [origin.strip() for origin in value_str.split(",") if origin.strip()]
-        return [value_str] if value_str else ["http://localhost:3000", "http://127.0.0.1:3000"]
+        return [value_str] if value_str else [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ]
 
     @field_validator("INGESTION_INTERVAL_MINUTES", mode="before")
     @classmethod
