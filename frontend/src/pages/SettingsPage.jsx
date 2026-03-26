@@ -8,7 +8,7 @@ const SettingsPage = () => {
   const [settings, setSettings] = useState({
     openrouterKey: '',
     newsapiKey: '',
-    neo4jUri: 'bolt://neo4j:7687',
+    neo4jUri: 'bolt://localhost:7687',
     neo4jUser: 'neo4j',
     neo4jPassword: '',
     ingestionInterval: 30,

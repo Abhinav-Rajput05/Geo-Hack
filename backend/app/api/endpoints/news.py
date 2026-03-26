@@ -12,9 +12,9 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.database.redis_client import redis_client
-from app.ingestion.news_ingestor import news_ingestor
+from app.realtime.ingestion_pipeline import realtime_ingestion_pipeline
 from app.vectorstore import chroma_service
-from app.main import limiter
+from app.limiter import limiter
 
 router = APIRouter()
 
@@ -160,10 +160,9 @@ async def trigger_ingestion_debug(
         f"(limit_per_source={limit_per_source})"
     )
     try:
-        result = await news_ingestor.ingest_all(
+        _ = keywords, country  # Reserved for compatibility.
+        result = await realtime_ingestion_pipeline.run_once(
             limit_per_source=limit_per_source,
-            keywords=[item.strip() for item in (keywords or "").split(",") if item.strip()],
-            country=country,
             category=category,
         )
         return {
@@ -324,7 +323,7 @@ async def _refresh_articles() -> Dict[str, Any]:
         {"status": "running", "last_run": datetime.utcnow().isoformat(), "articles_ingested": 0},
         expire=NEWS_CACHE_TTL_SECONDS,
     )
-    ingestion = await news_ingestor.ingest_all(limit_per_source=30)
+    ingestion = await realtime_ingestion_pipeline.run_once(limit_per_source=30)
     normalized = [_normalize_article(article) for article in ingestion.get("articles", [])]
     logger.info(
         "News refresh fetched "
@@ -367,6 +366,8 @@ def _normalize_article(article: Dict[str, Any]) -> Dict[str, Any]:
     content = article.get("content")
     region = article.get("region") or _infer_region(title, summary)
     categories = article.get("categories", [])
+    if not categories and article.get("category"):
+        categories = [str(article.get("category"))]
 
     return {
         "id": article.get("id") or str(uuid4()),

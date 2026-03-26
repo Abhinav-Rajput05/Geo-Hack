@@ -1,162 +1,98 @@
 # AI-Powered Global Ontology Engine
 
-A real-time knowledge graph system that ingests multi-domain data (geopolitics, economics, defense, technology, climate, society) to provide AI-driven strategic insights with an interactive world map visualization.
+A real-time knowledge graph system that ingests multi-domain data (geopolitics, economics, defense, technology, climate, society) and generates AI-driven strategic insights.
 
-## Features
+## Local-First Runtime Model
 
-- **Multi-Source Data Ingestion**: RSS feeds, NewsAPI, web scraping
-- **Knowledge Graph**: Neo4j-based ontology with entities and relationships
-- **GraphRAG**: AI-powered question answering using retrieval augmented generation
-- **Real-time Insights**: Risk analysis, trend visualization, impact mapping
-- **Interactive World Map**: Animated visualization with country-wise impact data
-- **Risk Analysis Dashboard**: Category-based risk assessment with trend analysis
+- `Neo4j`: local installation (not Docker)
+- `PostgreSQL`: local installation (not Docker)
+- `Redis`: Docker only
+- `Backend`, `Celery`, `Frontend`: run locally
 
-## Architecture
+## Prerequisites
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Frontend      │     │   Backend       │     │   Databases     │
-│   (React)       │◄───►│   (FastAPI)     │◄───►│   Neo4j         │
-│                 │     │                 │     │   PostgreSQL    │
-│   Port: 3000    │     │   Port: 8000    │     │   Redis         │
-└─────────────────┘     └────────┬────────┘     └─────────────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │   Celery Workers         │
-                    │   (Background Tasks)     │
-                    └─────────────────────────┘
-```
+- Python 3.11+
+- Node.js 18+
+- Docker (for Redis only)
+- Local Neo4j running on `bolt://localhost:7687`
+- Local PostgreSQL running on `localhost:5432`
 
 ## Quick Start
 
-### Prerequisites
-
-- Docker and Docker Compose
-- OpenRouter API Key
-- NewsAPI Key (optional)
-
-### Setup
-
-1. **Clone the repository**
-
-2. **Configure environment variables**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your API keys
+1. Copy env file:
+   ```powershell
+   Copy-Item .env.example backend/.env
    ```
 
-3. **Start the application**
-   ```bash
-   docker-compose up -d
+2. Update `backend/.env` with your credentials:
+   - `NEO4J_PASSWORD`
+   - `DATABASE_URL`
+   - `OPENROUTER_API_KEY`
+   - Optional: `NEWS_API_KEY`
+
+3. Start Redis via Docker:
+   ```powershell
+   docker compose up -d redis
    ```
 
-4. **Access the application**
-   - Frontend: http://localhost:3000
-   - Backend API: http://localhost:8000
-   - API Docs: http://localhost:8000/docs
-   - Neo4j Browser: http://localhost:7474
+4. Install backend dependencies:
+   ```powershell
+   cd backend
+   pip install -r requirements.txt
+   ```
 
-## Environment Variables
+5. Run backend API:
+   ```powershell
+   uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+   ```
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `OPENROUTER_API_KEY` | OpenRouter API key for GPT models | Yes |
-| `OPENROUTER_BASE_URL` | OpenRouter API base URL | Yes |
-| `NEWS_API_KEY` | NewsAPI key for news ingestion | No |
-| `NEO4J_URI` | Neo4j connection URI | Yes |
-| `NEO4J_PASSWORD` | Neo4j password | Yes |
-| `POSTGRES_URI` | PostgreSQL connection URI | Yes |
-| `REDIS_URL` | Redis connection URL | Yes |
+6. In a second terminal, run Celery worker:
+   ```powershell
+   cd backend
+   celery -A app.tasks.celery_app worker --loglevel=info
+   ```
 
-## Project Structure
+7. In a third terminal, run Celery beat:
+   ```powershell
+   cd backend
+   celery -A app.tasks.celery_app beat --loglevel=info
+   ```
 
-```
-.
-├── backend/
-│   ├── app/
-│   │   ├── api/endpoints/     # API routes
-│   │   ├── database/          # Database clients
-│   │   ├── config.py          # Configuration
-│   │   └── main.py            # FastAPI app
-│   ├── requirements.txt
-│   └── Dockerfile
-├── frontend/
-│   ├── src/
-│   │   ├── pages/             # React pages
-│   │   ├── components/        # React components
-│   │   ├── App.jsx
-│   │   └── main.jsx
-│   ├── package.json
-│   ├── vite.config.js
-│   └── Dockerfile
-├── docker-compose.yml
-├── .env.example
-└── README.md
-```
+8. Run frontend:
+   ```powershell
+   cd frontend
+   npm install
+   npm run dev
+   ```
 
-## API Endpoints
+## Helper Scripts (PowerShell)
 
-### Health
-- `GET /api/health` - System health check
+- `scripts/redis-up.ps1`
+- `scripts/redis-down.ps1`
+- `scripts/backend-dev.ps1`
+- `scripts/celery-worker.ps1`
+- `scripts/celery-beat.ps1`
+- `scripts/frontend-dev.ps1`
 
-### Query
-- `POST /api/query` - Ask questions to the knowledge graph
+## Access URLs
 
-### Insights
-- `GET /api/insights/risk` - Get risk analysis
-- `GET /api/insights/map` - Get map visualization data
-- `GET /api/insights/trends` - Get trend data
+- Frontend: http://localhost:3000
+- Backend API: http://localhost:8000
+- API Docs: http://localhost:8000/docs
+- Neo4j Browser (if enabled): http://localhost:7474
 
-### News
-- `GET /api/news/articles` - Get ingested articles
-- `GET /api/news/sources` - Get news sources
-- `POST /api/news/ingestion/trigger` - Trigger manual ingestion
+## Core Environment Variables
 
-### Ontology
-- `GET /api/ontology/stats` - Get graph statistics
-- `GET /api/ontology/entity-types` - Get entity types
-- `GET /api/ontology/relationship-types` - Get relationship types
-- `GET /api/ontology/entities/{id}` - Get entity details
-- `GET /api/ontology/search` - Search entities
+- `NEO4J_URI=bolt://localhost:7687`
+- `NEO4J_USER=neo4j`
+- `NEO4J_PASSWORD=<your_password>`
+- `DATABASE_URL=postgresql://ontology_user:password@localhost:5432/ontology_db`
+- `REDIS_URL=redis://localhost:6379/0`
+- `CELERY_BROKER_URL=redis://localhost:6379/0`
+- `CELERY_RESULT_BACKEND=redis://localhost:6379/0`
+- `OPENROUTER_API_KEY=<your_key>`
 
-## Technology Stack
+## Notes
 
-- **Backend**: Python, FastAPI, Neo4j, PostgreSQL, Redis
-- **Frontend**: React, Vite, React Simple Maps, D3.js, Recharts
-- **AI/ML**: GPT models via OpenRouter (OpenAI-compatible), LangChain
-- **Background Tasks**: Celery, Redis
-- **Containerization**: Docker, Docker Compose
-
-## Development
-
-### Running Locally
-
-**Backend:**
-```bash
-cd backend
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-**Frontend:**
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-### Running Tests
-
-```bash
-# Backend tests
-cd backend
-pytest
-
-# Frontend tests
-cd frontend
-npm test
-```
-
-## License
-
-MIT License - See LICENSE file for details
+- Dockerfiles are kept for optional container-based deployment, but local development is now local-first.
+- `docker-compose.yml` now manages Redis only.

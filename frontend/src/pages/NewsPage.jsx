@@ -1,80 +1,132 @@
-import React, { useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
-import { Newspaper, RefreshCw, Filter, ExternalLink, Clock, Tag } from 'lucide-react';
+import { RefreshCw, Clock, Tag } from 'lucide-react';
 import './NewsPage.css';
 
-const mockArticles = [
-  {
-    id: 1,
-    title: 'Global Tech Summit Addresses AI Regulation Framework',
-    summary: 'World leaders gather to discuss comprehensive frameworks for AI governance and international cooperation in technology standards.',
-    source: 'BBC World',
-    publishedAt: '2024-01-15T10:30:00Z',
-    categories: ['Technology', 'Policy'],
-    sentiment: 'neutral',
-    relevance: 0.92,
-  },
-  {
-    id: 2,
-    title: 'Semiconductor Supply Chain Crisis Deepens',
-    summary: 'Major chip manufacturers report ongoing supply constraints as geopolitical tensions affect global semiconductor trade routes.',
-    source: 'Reuters',
-    publishedAt: '2024-01-15T09:15:00Z',
-    categories: ['Technology', 'Economics'],
-    sentiment: 'negative',
-    relevance: 0.88,
-  },
-  {
-    id: 3,
-    title: 'NATO Expansion Discussed at Brussels Summit',
-    summary: 'Allied leaders meet to discuss further expansion of NATO coalition amid rising security concerns in Eastern Europe.',
-    source: 'Al Jazeera',
-    publishedAt: '2024-01-15T08:00:00Z',
-    categories: ['Defense', 'Politics'],
-    sentiment: 'neutral',
-    relevance: 0.95,
-  },
-  {
-    id: 4,
-    title: 'Climate Change Impact on Agricultural Production',
-    summary: 'New report details accelerating effects of climate change on global food production systems and trade patterns.',
-    source: 'AP News',
-    publishedAt: '2024-01-15T07:30:00Z',
-    categories: ['Climate', 'Economics'],
-    sentiment: 'negative',
-    relevance: 0.78,
-  },
-  {
-    id: 5,
-    title: 'Renewable Energy Investments Reach Record High',
-    summary: 'Global clean energy investments surge as countries accelerate transition away from fossil fuels.',
-    source: 'Reuters',
-    publishedAt: '2024-01-14T22:00:00Z',
-    categories: ['Climate', 'Energy'],
-    sentiment: 'positive',
-    relevance: 0.82,
-  },
-];
-
-const mockSources = [
-  { name: 'BBC World', type: 'RSS', active: true, articles: 450 },
-  { name: 'Reuters', type: 'RSS', active: true, articles: 380 },
-  { name: 'Al Jazeera', type: 'RSS', active: true, articles: 320 },
-  { name: 'NewsAPI', type: 'API', active: true, articles: 520 },
-  { name: 'AP News', type: 'API', active: true, articles: 280 },
-];
-
 const NewsPage = () => {
-  const [articles, setArticles] = useState(mockArticles);
+  const [articles, setArticles] = useState([]);
+  const [sources, setSources] = useState([]);
+  const [ingestionStatus, setIngestionStatus] = useState({ status: 'idle' });
   const [loading, setLoading] = useState(false);
-  const [filter, setFilter] = useState('all');
+  const [wsConnected, setWsConnected] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState('all');
+  const wsRef = useRef(null);
 
-  const categories = ['all', 'Technology', 'Politics', 'Economics', 'Defense', 'Climate', 'Energy'];
+  const categories = useMemo(() => {
+    const categorySet = new Set(['all']);
+    articles.forEach((article) => {
+      (article.categories || []).forEach((category) => categorySet.add(category));
+    });
+    return Array.from(categorySet);
+  }, [articles]);
 
-  const handleRefresh = () => {
+  useEffect(() => {
+    loadInitialData();
+  }, []);
+
+  useEffect(() => {
+    connectWebSocket();
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, [selectedCategory]);
+
+  const normalizeArticle = (article) => {
+    const categoriesFromBackend = Array.isArray(article.categories) ? article.categories : [];
+    const category = article.category ? [article.category] : [];
+    const categories = categoriesFromBackend.length ? categoriesFromBackend : category;
+
+    return {
+      id: article.id,
+      title: article.title,
+      summary: article.summary || '',
+      source: article.source || 'Unknown',
+      publishedAt: article.published_at || new Date().toISOString(),
+      categories: categories.length ? categories : ['general'],
+      sentiment: article.sentiment || 'neutral',
+      relevance: Number(article.relevance_score || 0),
+      url: article.url || '',
+    };
+  };
+
+  const loadInitialData = async () => {
     setLoading(true);
-    setTimeout(() => setLoading(false), 2000);
+    try {
+      const [articlesRes, sourcesRes, statusRes] = await Promise.all([
+        fetch('/api/v1/news/articles?limit=50'),
+        fetch('/api/v1/news/sources'),
+        fetch('/api/v1/news/ingestion/status'),
+      ]);
+
+      const [articlesData, sourcesData, statusData] = await Promise.all([
+        articlesRes.json(),
+        sourcesRes.json(),
+        statusRes.json(),
+      ]);
+
+      setArticles(Array.isArray(articlesData) ? articlesData.map(normalizeArticle) : []);
+      setSources(Array.isArray(sourcesData) ? sourcesData : []);
+      setIngestionStatus(statusData || { status: 'idle' });
+    } catch (error) {
+      console.error('Failed to load news data:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const connectWebSocket = () => {
+    if (wsRef.current) {
+      wsRef.current.close();
+    }
+
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const params = new URLSearchParams();
+    if (selectedCategory !== 'all') {
+      params.set('category', selectedCategory.toLowerCase());
+    }
+    const wsUrl = `${protocol}://${window.location.host}/ws/news${params.toString() ? `?${params.toString()}` : ''}`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setWsConnected(true);
+    };
+
+    ws.onclose = () => {
+      setWsConnected(false);
+    };
+
+    ws.onerror = () => {
+      setWsConnected(false);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const article = normalizeArticle(JSON.parse(event.data));
+        setArticles((prev) => {
+          if (prev.some((item) => item.id === article.id)) {
+            return prev;
+          }
+          return [article, ...prev].slice(0, 200);
+        });
+      } catch (error) {
+        console.error('Invalid websocket payload:', error);
+      }
+    };
+  };
+
+  const handleRefresh = async () => {
+    setLoading(true);
+    try {
+      await fetch('/api/v1/news/ingestion/trigger', { method: 'POST' });
+      await loadInitialData();
+    } catch (error) {
+      console.error('Failed to trigger ingestion:', error);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const getSentimentColor = (sentiment) => {
@@ -116,17 +168,17 @@ const NewsPage = () => {
           <span className="stat-label">Articles</span>
         </div>
         <div className="news-stat">
-          <span className="stat-value">5</span>
+          <span className="stat-value">{sources.length}</span>
           <span className="stat-label">Sources</span>
         </div>
         <div className="news-stat">
-          <span className="stat-value">12</span>
-          <span className="stat-label">In Queue</span>
+          <span className="stat-value">{ingestionStatus.articles_ingested || 0}</span>
+          <span className="stat-label">Ingested</span>
         </div>
         <div className="news-stat">
           <span className="stat-value status-running">
-            <span className="pulse"></span>
-            Running
+            <span className={wsConnected ? 'pulse' : ''}></span>
+            {wsConnected ? 'Live' : 'Disconnected'}
           </span>
         </div>
       </div>
@@ -202,15 +254,15 @@ const NewsPage = () => {
       <div className="sources-section">
         <h3>News Sources</h3>
         <div className="sources-grid">
-          {mockSources.map((source, index) => (
-            <div key={index} className="source-card card">
+          {sources.map((source, index) => (
+            <div key={`${source.name}-${index}`} className="source-card card">
               <div className="source-header">
                 <span className="source-name">{source.name}</span>
                 <span className={`status-dot ${source.active ? 'green' : 'red'}`}></span>
               </div>
               <div className="source-info">
                 <span className="source-type">{source.type}</span>
-                <span className="source-count">{source.articles} articles</span>
+                <span className="source-count">{source.articles_count} articles</span>
               </div>
             </div>
           ))}

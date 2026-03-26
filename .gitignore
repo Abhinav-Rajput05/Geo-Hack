@@ -3,3 +3,8 @@
 .env.*
 
 .pdf
+
+node_modules/
+.env
+dist/
+build/

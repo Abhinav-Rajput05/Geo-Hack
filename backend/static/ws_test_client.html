@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live News WebSocket Test</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    #status { margin-bottom: 12px; font-weight: 700; }
+    #log { white-space: pre-wrap; background: #f6f8fa; border: 1px solid #ddd; padding: 12px; height: 70vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>Live News WebSocket Test</h1>
+  <div id="status">Disconnected</div>
+  <div>
+    <label>Category filter: <input id="category" placeholder="geopolitics" /></label>
+    <label>Token: <input id="token" placeholder="optional" /></label>
+    <button id="connectBtn">Connect</button>
+  </div>
+  <pre id="log"></pre>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const connectBtn = document.getElementById('connectBtn');
+    let socket = null;
+
+    function log(line) {
+      logEl.textContent = `[${new Date().toISOString()}] ${line}\n` + logEl.textContent;
+    }
+
+    connectBtn.addEventListener('click', () => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
+
+      const category = document.getElementById('category').value.trim();
+      const token = document.getElementById('token').value.trim();
+      const params = new URLSearchParams();
+      if (category) params.set('category', category);
+      if (token) params.set('token', token);
+
+      const wsUrl = `ws://localhost:8000/ws/news${params.toString() ? `?${params.toString()}` : ''}`;
+      socket = new WebSocket(wsUrl);
+
+      socket.onopen = () => {
+        statusEl.textContent = 'Connected';
+        log('WebSocket connected');
+      };
+
+      socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        console.log('New Article:', data.title);
+        log(`New Article: ${data.title} | ${data.source} | ${data.category}`);
+      };
+
+      socket.onclose = () => {
+        statusEl.textContent = 'Disconnected';
+        log('WebSocket disconnected');
+      };
+
+      socket.onerror = (err) => {
+        log(`WebSocket error: ${err.message || 'unknown error'}`);
+      };
+    });
+  </script>
+</body>
+</html>

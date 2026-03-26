@@ -11,8 +11,8 @@ from app.config import settings
 # Celery configuration
 celery_app = Celery(
     'ontology_tasks',
-    broker=os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0'),
-    backend=os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0'),
+    broker=os.getenv('CELERY_BROKER_URL', settings.REDIS_URL),
+    backend=os.getenv('CELERY_RESULT_BACKEND', settings.REDIS_URL),
     include=['app.tasks.ingestion', 'app.tasks.nlp', 'app.tasks.graph']
 )
 

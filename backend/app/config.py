@@ -19,14 +19,15 @@ class Settings(BaseSettings):
     # Neo4j Graph Database
     NEO4J_URI: str = "bolt://localhost:7687"
     NEO4J_USER: str = "neo4j"
-    NEO4J_PASSWORD: str  # Required, no default
+    NEO4J_PASSWORD: str
     NEO4J_DATABASE: str = "neo4j"
     
     # PostgreSQL Database
-    DATABASE_URL: str  # Required, must be set via environment
+    DATABASE_URL: str = "postgresql://ontology_user:ontology123@localhost:5432/ontology_db"
     
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_NEWS_CHANNEL: str = "news:articles:live"
     
     # OpenRouter (OpenAI-compatible API)
     OPENROUTER_API_KEY: str
@@ -59,8 +60,10 @@ class Settings(BaseSettings):
     MAX_ARTICLES_PER_INGESTION: int = 150
     STARTUP_INGESTION_ENABLED: bool = True
     STARTUP_INGESTION_LIMIT: int = 5
-    NEWS_FETCH_TIMEOUT_SECONDS: int = 20
+    NEWS_FETCH_TIMEOUT_SECONDS: int = 8
+    NEWS_FETCH_RETRIES: int = 3
     NEWS_MAX_CONCURRENT_FETCHES: int = 8
+    NEWS_RATE_LIMIT_PER_SECOND: float = 8.0
     NEWS_MAX_CONCURRENT_ENRICHMENT: int = 4
     NEWS_DEDUP_SIMILARITY_THRESHOLD: float = 0.86
     NEWS_DEDUP_TTL_SECONDS: int = 21600
@@ -68,6 +71,10 @@ class Settings(BaseSettings):
     NEWS_MAX_LLM_TEXT_CHARS: int = 2800
     NEWS_BATCH_SIZE: int = 25
     NEWS_USE_LLM_ENRICHMENT: bool = False
+    NEWS_FEEDS_CONFIG_PATH: str = "app/ingestion/rss_feeds.json"
+    NEWS_SEEN_HASHES_FILE: str = "data/seen_article_hashes.txt"
+    WS_AUTH_TOKEN: Optional[str] = None
+    WS_EVENT_THROTTLE_MS: int = 0
     
     # GraphRAG Settings
     GRAPHRAG_TOP_K: int = 5
@@ -165,6 +172,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"
 
 
 @lru_cache()

@@ -1,12 +1,14 @@
 """
 Global Ontology Engine - Main FastAPI Application
 """
+import asyncio
+
 from fastapi import FastAPI, Request
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from loguru import logger
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from app.config import settings
@@ -14,10 +16,10 @@ from app.api import api_router
 from app.database.neo4j_client import neo4j_client
 from app.database.postgres_client import postgres_client
 from app.database.redis_client import redis_client
-from app.ingestion.news_ingestor import news_ingestor
-
-# Initialize rate limiter
-limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
+from app.realtime.event_consumer import redis_event_consumer
+from app.realtime.ingestion_pipeline import realtime_ingestion_pipeline
+from app.realtime.websocket_server import ws_router
+from app.ontology import ontology_service
 
 
 @asynccontextmanager
@@ -26,34 +28,41 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     
-    # Initialize database connections - FAIL FAST on critical database failures
+    # Initialize database connections - LOG WARNING on failures but continue
     try:
         await neo4j_client.connect()
         logger.info("Neo4j connection established")
+        try:
+            await ontology_service.ensure_search_indexes()
+            logger.info("Ontology search indexes ensured")
+        except Exception as e:
+            logger.warning(f"Failed to ensure ontology search indexes: {e}")
     except Exception as e:
-        logger.error(f"Failed to connect to Neo4j: {e}")
-        raise RuntimeError("Cannot start application: Neo4j connection failed") from e
-    
+        logger.warning(f"Failed to connect to Neo4j: {e}")
+
     try:
         await postgres_client.connect()
         logger.info("PostgreSQL connection established")
     except Exception as e:
-        logger.error(f"Failed to connect to PostgreSQL: {e}")
-        raise RuntimeError("Cannot start application: PostgreSQL connection failed") from e
-    
+        logger.warning(f"Failed to connect to PostgreSQL: {e}")
+
     try:
         await redis_client.connect()
         logger.info("Redis connection established")
     except Exception as e:
-        logger.error(f"Failed to connect to Redis: {e}")
-        raise RuntimeError("Cannot start application: Redis connection failed") from e
+        logger.warning(f"Failed to connect to Redis: {e}")
+    
+    app.state.realtime_stop_event = asyncio.Event()
+    app.state.realtime_consumer_task = asyncio.create_task(
+        redis_event_consumer.run(app.state.realtime_stop_event)
+    )
 
     if settings.startup_ingestion_enabled:
         try:
             logger.info(
                 f"Startup ingestion enabled (limit={settings.startup_ingestion_limit}); running ingestion"
             )
-            ingestion_result = await news_ingestor.ingest_all(
+            ingestion_result = await realtime_ingestion_pipeline.run_once(
                 limit_per_source=settings.startup_ingestion_limit
             )
             logger.info(
@@ -71,6 +80,14 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down application...")
+
+    if hasattr(app.state, "realtime_stop_event"):
+        app.state.realtime_stop_event.set()
+    if hasattr(app.state, "realtime_consumer_task"):
+        try:
+            await app.state.realtime_consumer_task
+        except Exception:
+            pass
     
     await neo4j_client.close()
     logger.info("Neo4j connection closed")
@@ -94,6 +111,9 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# Import limiter after app creation to avoid circular import
+from app.limiter import limiter
+
 # Add rate limiter to app state
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -109,6 +129,7 @@ app.add_middleware(
 
 # Include API router
 app.include_router(api_router, prefix=settings.API_PREFIX)
+app.include_router(ws_router)
 
 
 @app.get("/")
@@ -121,6 +142,12 @@ async def root():
         "docs": "/docs",
         "api": settings.API_PREFIX
     }
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    """Avoid noisy 404 logs when browsers request favicon."""
+    return Response(status_code=204)
 
 
 @app.get("/health")

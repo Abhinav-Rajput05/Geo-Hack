@@ -1,0 +1,22 @@
+[
+  {"name": "BBC World", "url": "https://feeds.bbci.co.uk/news/world/rss.xml", "category": "geopolitics"},
+  {"name": "BBC Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml", "category": "economy"},
+  {"name": "Reuters World", "url": "https://www.reutersagency.com/feed/?best-topics=world&post_type=best", "category": "geopolitics"},
+  {"name": "Reuters Business", "url": "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best", "category": "economy"},
+  {"name": "NYT World", "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "category": "geopolitics"},
+  {"name": "NYT Business", "url": "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "category": "economy"},
+  {"name": "The Guardian World", "url": "https://www.theguardian.com/world/rss", "category": "geopolitics"},
+  {"name": "The Guardian Business", "url": "https://www.theguardian.com/uk/business/rss", "category": "economy"},
+  {"name": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml", "category": "geopolitics"},
+  {"name": "DW Top Stories", "url": "https://rss.dw.com/rdf/rss-en-top", "category": "geopolitics"},
+  {"name": "NPR World", "url": "https://feeds.npr.org/1004/rss.xml", "category": "geopolitics"},
+  {"name": "AP News", "url": "https://feeds.apnews.com/apnews/rss/apf-topnews", "category": "geopolitics"},
+  {"name": "CNBC World", "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html", "category": "economy"},
+  {"name": "Financial Times World", "url": "https://www.ft.com/world?format=rss", "category": "economy"},
+  {"name": "TechCrunch", "url": "https://techcrunch.com/feed/", "category": "tech"},
+  {"name": "The Verge", "url": "https://www.theverge.com/rss/index.xml", "category": "tech"},
+  {"name": "Ars Technica", "url": "http://feeds.arstechnica.com/arstechnica/index", "category": "tech"},
+  {"name": "MIT Technology Review", "url": "https://www.technologyreview.com/feed/", "category": "tech"},
+  {"name": "NASA Climate", "url": "https://climate.nasa.gov/feeds/news/", "category": "climate"},
+  {"name": "UN Climate News", "url": "https://news.un.org/feed/subscribe/en/news/topic/climate-change/feed/rss.xml", "category": "climate"}
+]

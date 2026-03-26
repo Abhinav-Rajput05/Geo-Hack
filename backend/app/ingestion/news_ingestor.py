@@ -1,57 +1,67 @@
 """
-Advanced News Ingestion Service
+Production-ready news ingestion pipeline.
 
-Pipeline:
-Fetch -> Normalize -> Deduplicate -> Enrich -> Store -> Graph Update
+Pipeline steps:
+- load_feeds()
+- fetch_all_feeds_async()
+- parse_articles()
+- deduplicate_articles()
+- normalize_articles()
+- store_in_neo4j()
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import hashlib
-import re
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+import json
+import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import feedparser
 from dateutil import parser as date_parser
-from loguru import logger
 
 from app.config import settings
-from app.ingestion.deduplicator import NewsDeduplicator
-from app.ingestion.entity_extractor import NewsEntityExtractor
-from app.ingestion.graph_updater import graph_updater
+from app.database.neo4j_client import neo4j_client
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FeedSource:
+    name: str
+    url: str
+    category: str
+
+
+DEFAULT_FEEDS_PATH = Path(__file__).with_name("rss_feeds.json")
 
 
 class NewsIngestor:
-    """Service for ingesting near real-time global news from multiple sources."""
+    """Scalable async news ingestion service with robust Neo4j persistence."""
 
-    def __init__(self):
-        self.rss_feeds = settings.rss_feeds
+    def __init__(self) -> None:
         self.newsapi_key = settings.news_api_key
+        self.fetch_timeout_seconds = int(getattr(settings, "NEWS_FETCH_TIMEOUT_SECONDS", 8))
+        self.max_concurrent_fetches = int(getattr(settings, "NEWS_MAX_CONCURRENT_FETCHES", 12))
+        self.fetch_retries = int(getattr(settings, "NEWS_FETCH_RETRIES", 3))
+        self.max_articles_per_feed = int(getattr(settings, "MAX_ARTICLES_PER_INGESTION", 150))
+        self.rate_limit_per_second = float(getattr(settings, "NEWS_RATE_LIMIT_PER_SECOND", 8.0))
+        self.seen_hashes_file = Path(getattr(settings, "NEWS_SEEN_HASHES_FILE", "data/seen_article_hashes.txt"))
+        self.feeds_path = Path(getattr(settings, "NEWS_FEEDS_CONFIG_PATH", str(DEFAULT_FEEDS_PATH)))
 
-        self.gdelt_enabled = bool(getattr(settings, "GDELT_ENABLED", True))
-        self.event_registry_key = getattr(settings, "EVENT_REGISTRY_API_KEY", None)
+        self._fetch_semaphore = asyncio.Semaphore(self.max_concurrent_fetches)
+        self._rate_lock = asyncio.Lock()
+        self._last_request_ts = 0.0
 
-        self.fetch_timeout = int(getattr(settings, "NEWS_FETCH_TIMEOUT_SECONDS", 20))
-        self.max_concurrent_fetches = int(getattr(settings, "NEWS_MAX_CONCURRENT_FETCHES", 8))
-        self.max_concurrent_enrichment = int(getattr(settings, "NEWS_MAX_CONCURRENT_ENRICHMENT", 4))
-        self.max_raw_text_chars = int(getattr(settings, "NEWS_MAX_RAW_TEXT_CHARS", 9000))
-        self.batch_size = int(getattr(settings, "NEWS_BATCH_SIZE", 25))
-
-        self.user_agent = "global-ontology-engine/2.0"
-        self.fetch_semaphore = asyncio.Semaphore(self.max_concurrent_fetches)
-        self.enrichment_semaphore = asyncio.Semaphore(self.max_concurrent_enrichment)
-
-        self.deduplicator = NewsDeduplicator(
-            similarity_threshold=float(getattr(settings, "NEWS_DEDUP_SIMILARITY_THRESHOLD", 0.86)),
-            duplicate_ttl_seconds=int(getattr(settings, "NEWS_DEDUP_TTL_SECONDS", 6 * 60 * 60)),
-        )
-        self.entity_extractor = NewsEntityExtractor(
-            max_raw_text_chars=self.max_raw_text_chars,
-            max_llm_text_chars=int(getattr(settings, "NEWS_MAX_LLM_TEXT_CHARS", 2800)),
-            use_llm_enrichment=bool(getattr(settings, "NEWS_USE_LLM_ENRICHMENT", False)),
-        )
+        self._seen_hashes: Set[str] = set()
+        self._seen_loaded = False
+        self._neo4j_constraints_ready = False
 
     async def ingest_all(
         self,
@@ -60,618 +70,485 @@ class NewsIngestor:
         country: Optional[str] = None,
         category: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Ingest from all enabled sources with enrichment and graph updates.
-        """
-        start_ts = datetime.utcnow()
-        source_failures: Dict[str, str] = {}
-        source_counts: Dict[str, int] = {}
+        """Run end-to-end ingestion. Keeps interface compatible with existing task runner."""
+        _ = (keywords, country)  # Reserved for future filters.
+        started_at = datetime.now(timezone.utc)
 
-        fetched_articles, fetch_failures = await self._fetch_all_sources(
-            limit_per_source=limit_per_source,
-            keywords=keywords or [],
-            country=country,
-            category=category,
-        )
-        source_failures.update(fetch_failures)
-        source_counts.update(self._count_by_source(fetched_articles))
+        feeds = self.load_feeds(category=category)
+        feed_results, fetch_failures = await self.fetch_all_feeds_async(feeds, limit_per_source=limit_per_source)
 
-        normalized_articles = [self._normalize_article(article) for article in fetched_articles]
-        normalized_articles = [article for article in normalized_articles if article.get("url")]
+        parsed_articles: List[Dict[str, Any]] = []
+        for feed, payload in feed_results:
+            parsed_articles.extend(self.parse_articles(feed, payload, limit_per_source=limit_per_source))
 
-        if not normalized_articles:
-            logger.warning("No articles fetched from external feeds; using fallback mock records")
-            normalized_articles = self._mock_articles(limit=min(limit_per_source, 5))
+        newsapi_articles = await self._fetch_newsapi_async(limit_per_source=limit_per_source, category=category)
+        if newsapi_articles:
+            parsed_articles.extend(newsapi_articles)
 
-        deduplicated, dedup_metrics = await self.deduplicator.deduplicate(normalized_articles)
+        deduplicated_articles = self.deduplicate_articles(parsed_articles)
+        normalized_articles = self.normalize_articles(deduplicated_articles)
+        stored_count = await self.store_in_neo4j(normalized_articles)
+        source_counts = self._count_by_source(normalized_articles)
+
+        total_feeds = len(feeds)
+        total_fetched = len(parsed_articles)
+        total_unique = len(normalized_articles)
+
         logger.info(
-            "Deduplication metrics: "
-            f"input={dedup_metrics['input_count']} output={dedup_metrics['output_count']} "
-            f"skip_url={dedup_metrics['skipped_by_url']} "
-            f"skip_title={dedup_metrics['skipped_by_title_similarity']} "
-            f"skip_cache={dedup_metrics['skipped_by_cache']}"
+            "[SUMMARY] feeds_processed=%s fetched=%s unique=%s stored=%s failures=%s",
+            total_feeds,
+            total_fetched,
+            total_unique,
+            stored_count,
+            len(fetch_failures),
         )
 
-        enriched_articles = await self._enrich_articles_chunked(deduplicated)
-        persisted_count = await self.persist_to_neo4j(enriched_articles)
+        if total_fetched == 0:
+            logger.warning("[SUMMARY] 0 articles fetched from all configured sources")
 
-        total_seconds = round((datetime.utcnow() - start_ts).total_seconds(), 3)
+        duration_sec = round((datetime.now(timezone.utc) - started_at).total_seconds(), 3)
         return {
-            "total_articles": len(fetched_articles),
-            "normalized_articles": len(normalized_articles),
-            "unique_articles": len(deduplicated),
-            "persisted_to_neo4j": persisted_count,
+            "total_articles": total_fetched,
+            "unique_articles": total_unique,
+            "total_feeds_processed": total_feeds,
+            "total_articles_fetched": total_fetched,
+            "total_articles_unique": total_unique,
+            "persisted_to_neo4j": stored_count,
+            "source_failures": fetch_failures,
             "source_counts": source_counts,
-            "sources": sorted({a.get("source", "Unknown") for a in deduplicated}),
-            "source_failures": source_failures,
-            "dedup_metrics": dedup_metrics,
-            "processing_seconds": total_seconds,
-            "ingested_at": datetime.utcnow().isoformat(),
-            "articles": enriched_articles,
+            "sources": sorted({a["source"] for a in normalized_articles}) if normalized_articles else [],
+            "processing_seconds": duration_sec,
+            "ingested_at": datetime.now(timezone.utc).isoformat(),
+            "articles": normalized_articles,
         }
 
-    async def _fetch_all_sources(
-        self,
-        limit_per_source: int,
-        keywords: List[str],
-        country: Optional[str],
-        category: Optional[str],
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-        failures: Dict[str, str] = {}
-        tasks = []
+    def load_feeds(self, category: Optional[str] = None) -> List[FeedSource]:
+        """Load feed list from JSON config with fallback to settings.RSS_FEEDS."""
+        loaded_feeds: List[FeedSource] = []
 
-        connector = aiohttp.TCPConnector(limit=self.max_concurrent_fetches, ttl_dns_cache=300)
-        timeout = aiohttp.ClientTimeout(total=self.fetch_timeout)
-        headers = {"User-Agent": self.user_agent}
+        config_path = self.feeds_path
+        if not config_path.is_absolute():
+            # Resolve relative to backend app directory.
+            config_path = (Path(__file__).resolve().parents[2] / config_path).resolve()
 
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
-            tasks.append(
-                asyncio.create_task(self.ingest_from_rss(session=session, limit=limit_per_source))
-            )
-            tasks.append(
-                asyncio.create_task(
-                    self.ingest_from_newsapi(
-                        session=session,
-                        limit=limit_per_source,
-                        keywords=keywords,
-                        country=country,
-                        category=category,
-                    )
-                )
-            )
-            tasks.append(
-                asyncio.create_task(
-                    self.ingest_from_gdelt(
-                        session=session,
-                        limit=limit_per_source,
-                        keywords=keywords,
-                        country=country,
-                        category=category,
-                    )
-                )
-            )
-            tasks.append(
-                asyncio.create_task(
-                    self.ingest_from_eventregistry(
-                        session=session,
-                        limit=limit_per_source,
-                        keywords=keywords,
-                    )
-                )
-            )
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        all_articles: List[Dict[str, Any]] = []
-        for index, result in enumerate(results):
-            source_name = ["rss", "newsapi", "gdelt", "eventregistry"][index]
-            if isinstance(result, Exception):
-                failures[source_name] = str(result)
-                logger.error(f"{source_name} ingestion failed: {result}")
-                continue
-            all_articles.extend(result)
-
-        return all_articles, failures
-
-    async def ingest_from_rss(
-        self,
-        session: aiohttp.ClientSession,
-        limit: int = 50,
-    ) -> List[Dict[str, Any]]:
-        """Parallel RSS ingestion."""
-        feed_tasks = [
-            asyncio.create_task(self._fetch_single_rss_feed(session, feed_url, limit))
-            for feed_url in self.rss_feeds
-        ]
-        feed_results = await asyncio.gather(*feed_tasks, return_exceptions=True)
-
-        articles: List[Dict[str, Any]] = []
-        for result in feed_results:
-            if isinstance(result, Exception):
-                logger.error(f"RSS feed task failed: {result}")
-                continue
-            articles.extend(result)
-        return articles
-
-    async def _fetch_single_rss_feed(
-        self,
-        session: aiohttp.ClientSession,
-        feed_url: str,
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        async with self.fetch_semaphore:
+        if config_path.exists():
             try:
-                payload = await self._http_get_bytes(session, feed_url)
-                feed = feedparser.parse(payload)
-                source_name = feed.feed.get("title") or self._source_from_url(feed_url)
-                entries = feed.entries[:limit]
-                logger.info(f"RSS source={source_name} entries={len(entries)} url={feed_url}")
-
-                parsed: List[Dict[str, Any]] = []
-                for entry in entries:
-                    item = self._parse_rss_entry(entry=entry, source_name=source_name)
-                    if item:
-                        parsed.append(item)
-                return parsed
+                entries = json.loads(config_path.read_text(encoding="utf-8"))
+                for row in entries:
+                    if not isinstance(row, dict):
+                        continue
+                    name = str(row.get("name", "Unknown Feed")).strip()
+                    url = str(row.get("url", "")).strip()
+                    feed_category = str(row.get("category", "general")).strip().lower()
+                    if name and url:
+                        loaded_feeds.append(FeedSource(name=name, url=url, category=feed_category))
             except Exception as exc:
-                logger.error(f"RSS parsing error source={feed_url}: {exc}")
-                return []
+                logger.error("[ERROR] Failed to load feeds config from %s: %s", config_path, exc)
 
-    async def ingest_from_newsapi(
+        if not loaded_feeds:
+            for url in getattr(settings, "RSS_FEEDS", []):
+                if isinstance(url, str) and url.strip():
+                    loaded_feeds.append(FeedSource(name=url, url=url.strip(), category="general"))
+
+        if category:
+            category_normalized = category.strip().lower()
+            loaded_feeds = [f for f in loaded_feeds if f.category == category_normalized]
+
+        logger.info("[INGEST] Loaded %s RSS feeds", len(loaded_feeds))
+        return loaded_feeds
+
+    async def fetch_all_feeds_async(
+        self,
+        feeds: List[FeedSource],
+        limit_per_source: int,
+    ) -> Tuple[List[Tuple[FeedSource, bytes]], Dict[str, str]]:
+        """Fetch all RSS feeds in parallel with retry and timeout handling."""
+        timeout = aiohttp.ClientTimeout(total=self.fetch_timeout_seconds)
+        headers = {"User-Agent": "global-ontology-engine/3.0"}
+        connector = aiohttp.TCPConnector(limit=self.max_concurrent_fetches, ttl_dns_cache=300)
+
+        results: List[Tuple[FeedSource, bytes]] = []
+        failures: Dict[str, str] = {}
+
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+            tasks = [
+                asyncio.create_task(self._fetch_single_feed(session=session, feed=feed, limit_per_source=limit_per_source))
+                for feed in feeds
+            ]
+            completed = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for item in completed:
+            if isinstance(item, Exception):
+                logger.error("[ERROR] Unexpected feed task failure: %s", item)
+                continue
+            feed, payload, error_text = item
+            if error_text:
+                failures[feed.name] = error_text
+                logger.error("[ERROR] Feed failed: %s (%s)", feed.name, error_text)
+                continue
+            results.append((feed, payload))
+
+        return results, failures
+
+    async def _fetch_single_feed(
         self,
         session: aiohttp.ClientSession,
-        limit: int = 50,
-        keywords: Optional[List[str]] = None,
-        country: Optional[str] = None,
-        category: Optional[str] = None,
+        feed: FeedSource,
+        limit_per_source: int,
+    ) -> Tuple[FeedSource, bytes, Optional[str]]:
+        """Fetch one feed with retries, timeout safety, and basic rate limiting."""
+        _ = limit_per_source  # kept for future provider-specific query params
+        logger.info("[INGEST] Fetching feed: %s", feed.name)
+
+        for attempt in range(1, self.fetch_retries + 1):
+            try:
+                async with self._fetch_semaphore:
+                    await self._apply_rate_limit()
+                    async with session.get(feed.url) as response:
+                        response.raise_for_status()
+                        payload = await response.read()
+
+                if not payload:
+                    raise ValueError("empty response")
+
+                logger.info("[INGEST] Success: %s bytes from %s", len(payload), feed.name)
+                return feed, payload, None
+            except Exception as exc:
+                if attempt >= self.fetch_retries:
+                    return feed, b"", str(exc)
+                await asyncio.sleep(min(1.5 * attempt, 4.0))
+
+        return feed, b"", "unreachable"
+
+    async def _apply_rate_limit(self) -> None:
+        """Simple per-request pacing to avoid aggressive burst traffic."""
+        if self.rate_limit_per_second <= 0:
+            return
+
+        min_interval = 1.0 / self.rate_limit_per_second
+        loop = asyncio.get_running_loop()
+
+        async with self._rate_lock:
+            now = loop.time()
+            elapsed = now - self._last_request_ts
+            if elapsed < min_interval:
+                await asyncio.sleep(min_interval - elapsed)
+            self._last_request_ts = loop.time()
+
+    def parse_articles(
+        self,
+        feed: FeedSource,
+        payload: bytes,
+        limit_per_source: int,
     ) -> List[Dict[str, Any]]:
-        """NewsAPI ingestion with optional filters."""
+        """Parse RSS bytes into raw article dicts."""
+        articles: List[Dict[str, Any]] = []
+        try:
+            parsed = feedparser.parse(payload)
+            if getattr(parsed, "bozo", 0):
+                logger.warning("[ERROR] Feed has parsing warnings: %s", feed.name)
+
+            entries = list(parsed.entries or [])[: max(1, limit_per_source)]
+            if not entries:
+                logger.warning("[INGEST] No entries found for feed: %s", feed.name)
+                return articles
+
+            for entry in entries:
+                url = str(getattr(entry, "link", "")).strip()
+                title = self._clean_text(str(getattr(entry, "title", "")).strip())
+                summary = self._clean_text(
+                    str(getattr(entry, "summary", "") or getattr(entry, "description", "")).strip()
+                )
+                if not title or not url:
+                    continue
+
+                articles.append(
+                    {
+                        "title": title,
+                        "summary": summary,
+                        "source": feed.name,
+                        "published_at": self._to_iso8601(getattr(entry, "published", None)),
+                        "url": url,
+                        "category": feed.category,
+                    }
+                )
+
+            logger.info("[INGEST] Success: %s articles", len(articles))
+            return articles
+        except Exception as exc:
+            logger.error("[ERROR] Feed parse failed: %s (%s)", feed.name, exc)
+            return []
+
+    def deduplicate_articles(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove duplicates via hash(title + url), including previously-seen entries."""
+        self._load_seen_hashes()
+
+        unique_articles: List[Dict[str, Any]] = []
+        removed = 0
+
+        for article in articles:
+            article_hash = self._build_article_hash(article.get("title", ""), article.get("url", ""))
+            if article_hash in self._seen_hashes:
+                removed += 1
+                continue
+
+            article["id"] = article_hash
+            self._seen_hashes.add(article_hash)
+            unique_articles.append(article)
+
+        self._persist_seen_hashes()
+        logger.info("[DEDUP] Removed %s duplicates", removed)
+        return unique_articles
+
+    def normalize_articles(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Normalize into canonical article schema."""
+        normalized: List[Dict[str, Any]] = []
+        for article in articles:
+            normalized.append(
+                {
+                    "id": article["id"],
+                    "title": str(article.get("title", "")).strip(),
+                    "summary": str(article.get("summary", "")).strip(),
+                    "source": str(article.get("source", "Unknown")).strip(),
+                    "published_at": self._to_iso8601(article.get("published_at")),
+                    "url": str(article.get("url", "")).strip(),
+                    "category": str(article.get("category", "general")).strip().lower(),
+                }
+            )
+        return normalized
+
+    async def store_in_neo4j(self, articles: List[Dict[str, Any]]) -> int:
+        """Persist normalized articles using MERGE and transactional writes."""
+        if not articles:
+            logger.warning("[DB] No articles to insert into Neo4j")
+            return 0
+
+        try:
+            if not neo4j_client.driver:
+                await neo4j_client.connect()
+
+            if not self._neo4j_constraints_ready:
+                await self._ensure_neo4j_constraints()
+                self._neo4j_constraints_ready = True
+
+            query = """
+            UNWIND $articles AS article
+            MERGE (a:Article {id: article.id})
+            ON CREATE SET a.created_at = datetime()
+            SET a.title = article.title,
+                a.summary = article.summary,
+                a.url = article.url,
+                a.published_at = article.published_at,
+                a.updated_at = datetime()
+            MERGE (s:Source {name: article.source})
+            MERGE (a)-[:PUBLISHED_BY]->(s)
+            MERGE (c:Category {name: article.category})
+            MERGE (a)-[:IN_CATEGORY]->(c)
+            """
+            await neo4j_client.execute_write(query=query, parameters={"articles": articles})
+            logger.info("[DB] Inserted %s articles into Neo4j", len(articles))
+            return len(articles)
+        except Exception as exc:
+            logger.error("[DB] Neo4j persistence failed: %s", exc)
+            return 0
+
+    async def _ensure_neo4j_constraints(self) -> None:
+        """Create idempotent schema constraints for stable MERGE behavior."""
+        constraints = [
+            "CREATE CONSTRAINT article_id_unique IF NOT EXISTS FOR (a:Article) REQUIRE a.id IS UNIQUE",
+            "CREATE CONSTRAINT article_url_unique IF NOT EXISTS FOR (a:Article) REQUIRE a.url IS UNIQUE",
+            "CREATE CONSTRAINT source_name_unique IF NOT EXISTS FOR (s:Source) REQUIRE s.name IS UNIQUE",
+            "CREATE CONSTRAINT category_name_unique IF NOT EXISTS FOR (c:Category) REQUIRE c.name IS UNIQUE",
+        ]
+        for statement in constraints:
+            try:
+                await neo4j_client.execute_write(statement)
+            except Exception as exc:
+                logger.warning("[DB] Constraint setup warning: %s", exc)
+
+    async def _fetch_newsapi_async(self, limit_per_source: int, category: Optional[str]) -> List[Dict[str, Any]]:
+        """Optional NewsAPI ingestion for additional coverage."""
         if not self.newsapi_key:
             return []
 
-        keywords = keywords or []
-        query = " OR ".join(keywords[:5]).strip()
         endpoint = "https://newsapi.org/v2/top-headlines"
         params: Dict[str, Any] = {
             "apiKey": self.newsapi_key,
-            "pageSize": limit,
             "language": "en",
+            "pageSize": max(1, min(limit_per_source, 100)),
         }
-        if query:
-            params["q"] = query
-        if country:
-            params["country"] = country.lower()[:2]
         if category:
             params["category"] = category.lower()
 
-        # everything endpoint works better when only query is present.
-        if query and not country and not category:
-            endpoint = "https://newsapi.org/v2/everything"
-            params["sortBy"] = "publishedAt"
-            params.pop("country", None)
-            params.pop("category", None)
+        timeout = aiohttp.ClientTimeout(total=self.fetch_timeout_seconds)
+        headers = {"User-Agent": "global-ontology-engine/3.0"}
 
-        try:
-            data = await self._http_get_json(session, endpoint, params=params)
-            if data.get("status") != "ok":
-                raise RuntimeError(f"NewsAPI status={data.get('status')}")
-            articles: List[Dict[str, Any]] = []
-            for payload in data.get("articles", []):
-                parsed = self._parse_newsapi_article(payload)
-                if parsed:
-                    articles.append(parsed)
-            return articles
-        except Exception as exc:
-            logger.error(f"NewsAPI fetch failed: {exc}")
-            return []
-
-    async def ingest_from_gdelt(
-        self,
-        session: aiohttp.ClientSession,
-        limit: int = 50,
-        keywords: Optional[List[str]] = None,
-        country: Optional[str] = None,
-        category: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        GDELT article ingestion (OSINT source).
-        """
-        if not self.gdelt_enabled:
-            return []
-
-        query_terms = list(keywords or [])
-        if country:
-            query_terms.append(country)
-        if category:
-            query_terms.append(category)
-        query = " AND ".join(term for term in query_terms if term) or "geopolitics OR economy"
-
-        params = {
-            "query": query,
-            "mode": "ArtList",
-            "format": "json",
-            "sort": "HybridRel",
-            "maxrecords": min(limit, 250),
-        }
-        url = "https://api.gdeltproject.org/api/v2/doc/doc"
-        try:
-            data = await self._http_get_json(session, url, params=params)
-            rows = data.get("articles", [])
-            parsed: List[Dict[str, Any]] = []
-            for row in rows:
-                item = self._parse_gdelt_article(row)
-                if item:
-                    parsed.append(item)
-            return parsed
-        except Exception as exc:
-            logger.error(f"GDELT fetch failed: {exc}")
-            return []
-
-    async def ingest_from_eventregistry(
-        self,
-        session: aiohttp.ClientSession,
-        limit: int = 50,
-        keywords: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Optional EventRegistry source; skipped when key is not configured."""
-        if not self.event_registry_key:
-            return []
-
-        # A tolerant payload: unsupported fields are ignored by API.
-        payload: Dict[str, Any] = {
-            "apiKey": self.event_registry_key,
-            "resultType": "articles",
-            "articlesPage": 1,
-            "articlesCount": min(limit, 100),
-            "articlesSortBy": "date",
-            "lang": "eng",
-        }
-        if keywords:
-            payload["keyword"] = " OR ".join(keywords[:5])
-
-        url = "https://eventregistry.org/api/v1/article/getArticles"
-        try:
-            data = await self._http_post_json(session, url=url, payload=payload)
-            rows = (
-                data.get("articles", {}).get("results")
-                or data.get("articles", [])
-                or []
-            )
-            parsed: List[Dict[str, Any]] = []
-            for row in rows:
-                item = self._parse_eventregistry_article(row)
-                if item:
-                    parsed.append(item)
-            return parsed
-        except Exception as exc:
-            logger.error(f"EventRegistry fetch failed: {exc}")
-            return []
-
-    async def _http_get_bytes(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
-        params: Optional[Dict[str, Any]] = None,
-        retries: int = 2,
-    ) -> bytes:
-        for attempt in range(retries + 1):
+        for attempt in range(1, self.fetch_retries + 1):
             try:
-                async with session.get(url, params=params) as response:
-                    response.raise_for_status()
-                    return await response.read()
-            except Exception:
-                if attempt >= retries:
-                    raise
-                await asyncio.sleep(0.5 * (attempt + 1))
-        return b""
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    async with self._fetch_semaphore:
+                        await self._apply_rate_limit()
+                        async with session.get(endpoint, params=params) as response:
+                            response.raise_for_status()
+                            data = await response.json()
 
-    async def _http_get_json(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
-        params: Optional[Dict[str, Any]] = None,
-        retries: int = 2,
-    ) -> Dict[str, Any]:
-        payload = await self._http_get_bytes(session=session, url=url, params=params, retries=retries)
-        text = payload.decode("utf-8", errors="ignore")
-        import json
+                if data.get("status") != "ok":
+                    raise ValueError(f"unexpected status: {data.get('status')}")
 
-        return json.loads(text) if text else {}
-
-    async def _http_post_json(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
-        payload: Dict[str, Any],
-        retries: int = 2,
-    ) -> Dict[str, Any]:
-        import json
-
-        for attempt in range(retries + 1):
-            try:
-                async with session.post(url, json=payload) as response:
-                    response.raise_for_status()
-                    text = await response.text()
-                    return json.loads(text) if text else {}
-            except Exception:
-                if attempt >= retries:
-                    raise
-                await asyncio.sleep(0.5 * (attempt + 1))
-        return {}
-
-    def _normalize_article(self, article: Dict[str, Any]) -> Dict[str, Any]:
-        title = (article.get("title") or "Untitled").strip()
-        description = (article.get("description") or article.get("summary") or "").strip()
-        raw_text = (article.get("raw_text") or article.get("content") or description).strip()
-        raw_text = self._strip_html(raw_text)[: self.max_raw_text_chars]
-        url = (article.get("url") or "").strip()
-        source = article.get("source") or "Unknown"
-        published_at = self._safe_iso_date(article.get("published_at"))
-
-        categories = article.get("categories") or []
-        if not isinstance(categories, list):
-            categories = [str(categories)]
-        categories = [str(c).strip() for c in categories if str(c).strip()]
-        if not categories:
-            categories = [self._infer_primary_category(title=title, description=description)]
-
-        article_id = article.get("id")
-        if not article_id:
-            article_id = hashlib.sha1((url or title).encode("utf-8")).hexdigest()[:20]
-
-        return {
-            "id": article_id,
-            "title": title,
-            "description": description[:1200],
-            "summary": description[:700],
-            "source": source,
-            "url": url,
-            "published_at": published_at,
-            "location": article.get("location") or {"name": "Global", "lat": None, "lon": None},
-            "raw_text": raw_text,
-            "content": raw_text,
-            "categories": categories,
-            "source_type": article.get("source_type", "unknown"),
-            "author": article.get("author"),
-            "ingested_at": datetime.utcnow().isoformat(),
-            "status": "pending",
-        }
-
-    async def _enrich_articles_chunked(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not articles:
-            return []
-
-        enriched: List[Dict[str, Any]] = []
-        for offset in range(0, len(articles), self.batch_size):
-            chunk = articles[offset: offset + self.batch_size]
-            tasks = [asyncio.create_task(self._enrich_single_article(article)) for article in chunk]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for article, result in zip(chunk, results):
-                if isinstance(result, Exception):
-                    logger.error(f"Enrichment failed url={article.get('url')}: {result}")
-                    article["sentiment"] = "neutral"
-                    article["sentiment_score"] = 0.0
-                    article["entities"] = []
-                    article["topic"] = self._infer_primary_category(
-                        title=article.get("title", ""),
-                        description=article.get("description", ""),
+                mapped: List[Dict[str, Any]] = []
+                for row in data.get("articles", []):
+                    title = self._clean_text(str(row.get("title") or ""))
+                    url = str(row.get("url") or "").strip()
+                    if not title or not url:
+                        continue
+                    mapped.append(
+                        {
+                            "title": title,
+                            "summary": self._clean_text(str(row.get("description") or row.get("content") or "")),
+                            "source": str((row.get("source") or {}).get("name") or "NewsAPI").strip(),
+                            "published_at": self._to_iso8601(row.get("publishedAt")),
+                            "url": url,
+                            "category": (category or "general").lower(),
+                        }
                     )
-                    article["source_credibility"] = 0.6
-                    article["confidence_score"] = 0.4
-                    article["event_key"] = hashlib.sha1(
-                        f"{article.get('title')}::{article.get('published_at')}".encode("utf-8")
-                    ).hexdigest()[:24]
-                    enriched.append(article)
-                else:
-                    enriched.append(result)
-        return enriched
 
-    async def _enrich_single_article(self, article: Dict[str, Any]) -> Dict[str, Any]:
-        async with self.enrichment_semaphore:
-            return await self.entity_extractor.enrich_article(article)
-
-    async def persist_to_neo4j(self, articles: List[Dict[str, Any]]) -> int:
-        if not articles:
-            return 0
-        persisted_count = 0
-        for article in articles:
-            try:
-                await graph_updater.upsert_article_event(article)
-                persisted_count += 1
+                logger.info("[INGEST] NewsAPI success: %s articles", len(mapped))
+                return mapped
             except Exception as exc:
-                logger.error(f"Graph update failed url={article.get('url')}: {exc}")
-        return persisted_count
+                if attempt >= self.fetch_retries:
+                    logger.error("[ERROR] NewsAPI failed: %s", exc)
+                    return []
+                await asyncio.sleep(min(1.5 * attempt, 4.0))
 
-    def _parse_rss_entry(self, entry: Any, source_name: str) -> Optional[Dict[str, Any]]:
+        return []
+
+    def _load_seen_hashes(self) -> None:
+        if self._seen_loaded:
+            return
+        self._seen_loaded = True
+
+        path = self.seen_hashes_file
+        if not path.is_absolute():
+            path = (Path(__file__).resolve().parents[2] / path).resolve()
+        self.seen_hashes_file = path
+
         try:
-            title = getattr(entry, "title", "Untitled")
-            description = getattr(entry, "summary", "") or getattr(entry, "description", "")
-            categories = []
-            if hasattr(entry, "tags"):
-                categories = [tag.term for tag in entry.tags if getattr(tag, "term", None)]
-            published_at = self._safe_iso_date(getattr(entry, "published", None))
-            link = getattr(entry, "link", "")
-            return {
-                "title": self._strip_html(title),
-                "description": self._strip_html(description),
-                "source": source_name,
-                "url": link,
-                "published_at": published_at,
-                "location": {"name": "Global", "lat": None, "lon": None},
-                "raw_text": f"{title}. {self._strip_html(description)}",
-                "categories": categories,
-                "source_type": "rss",
-            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    item = line.strip()
+                    if item:
+                        self._seen_hashes.add(item)
         except Exception as exc:
-            logger.error(f"RSS entry parsing failed: {exc}")
-            return None
+            logger.warning("[DEDUP] Failed loading seen hash file %s: %s", path, exc)
 
-    def _parse_newsapi_article(self, article: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _persist_seen_hashes(self) -> None:
         try:
-            source = article.get("source", {}).get("name", "NewsAPI")
-            title = article.get("title") or "Untitled"
-            description = article.get("description") or article.get("content") or ""
-            return {
-                "title": self._strip_html(title),
-                "description": self._strip_html(description),
-                "source": source,
-                "url": article.get("url", ""),
-                "published_at": self._safe_iso_date(article.get("publishedAt")),
-                "location": {"name": "Global", "lat": None, "lon": None},
-                "raw_text": self._strip_html(article.get("content") or description),
-                "categories": [self._infer_primary_category(title, description)],
-                "author": article.get("author"),
-                "source_type": "newsapi",
-            }
+            self.seen_hashes_file.parent.mkdir(parents=True, exist_ok=True)
+            self.seen_hashes_file.write_text("\n".join(sorted(self._seen_hashes)), encoding="utf-8")
         except Exception as exc:
-            logger.error(f"NewsAPI article parsing failed: {exc}")
-            return None
+            logger.warning("[DEDUP] Failed persisting seen hashes: %s", exc)
 
-    def _parse_gdelt_article(self, article: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        try:
-            title = article.get("title") or "Untitled"
-            excerpt = article.get("seendate") or article.get("socialimage") or ""
-            url = article.get("url") or article.get("sourceurl") or ""
-            if not url:
-                return None
-            source = article.get("domain") or "GDELT"
-            return {
-                "title": self._strip_html(title),
-                "description": self._strip_html(article.get("snippet") or excerpt),
-                "source": source,
-                "url": url,
-                "published_at": self._safe_iso_date(article.get("seendate")),
-                "location": {"name": article.get("sourcecountry") or "Global", "lat": None, "lon": None},
-                "raw_text": self._strip_html(article.get("snippet") or title),
-                "categories": [self._infer_primary_category(title, article.get("snippet", ""))],
-                "source_type": "gdelt",
-            }
-        except Exception as exc:
-            logger.error(f"GDELT article parsing failed: {exc}")
-            return None
+    @staticmethod
+    def _build_article_hash(title: str, url: str) -> str:
+        payload = f"{title.strip().lower()}::{url.strip().lower()}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def _parse_eventregistry_article(self, article: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        try:
-            title = article.get("title") or "Untitled"
-            body = article.get("body") or article.get("summary") or ""
-            source = (article.get("source") or {}).get("title") or "EventRegistry"
-            url = article.get("url") or ""
-            if not url:
-                return None
-            categories = []
-            for category in article.get("categories", []) or []:
-                label = category.get("label") if isinstance(category, dict) else str(category)
-                if label:
-                    categories.append(label)
-            return {
-                "title": self._strip_html(title),
-                "description": self._strip_html(body[:1200]),
-                "source": source,
-                "url": url,
-                "published_at": self._safe_iso_date(article.get("date")),
-                "location": {"name": "Global", "lat": None, "lon": None},
-                "raw_text": self._strip_html(body),
-                "categories": categories,
-                "source_type": "eventregistry",
-            }
-        except Exception as exc:
-            logger.error(f"EventRegistry article parsing failed: {exc}")
-            return None
-
-    def _infer_primary_category(self, title: str, description: str) -> str:
-        text = f"{title} {description}".lower()
-        mapping = {
-            "Politics": ("election", "government", "minister", "president", "parliament"),
-            "Economics": ("economy", "inflation", "gdp", "market", "trade"),
-            "Defense": ("military", "war", "missile", "defense", "conflict"),
-            "Technology": ("ai", "software", "chip", "cyber", "tech"),
-            "Climate": ("climate", "flood", "wildfire", "storm", "temperature"),
-            "Energy": ("oil", "gas", "solar", "wind", "power"),
-            "Health": ("health", "hospital", "vaccine", "virus", "disease"),
-        }
-        for category, keywords in mapping.items():
-            if any(keyword in text for keyword in keywords):
-                return category
-        return "General"
-
-    def _strip_html(self, html: str) -> str:
-        return re.sub(r"<[^>]+>", "", html or "")
-
-    def _safe_iso_date(self, value: Optional[str]) -> str:
+    @staticmethod
+    def _to_iso8601(value: Any) -> str:
         if not value:
-            return datetime.utcnow().isoformat()
+            return datetime.now(timezone.utc).isoformat()
         try:
-            return date_parser.parse(value).isoformat()
+            return date_parser.parse(str(value)).astimezone(timezone.utc).isoformat()
         except Exception:
-            return datetime.utcnow().isoformat()
+            return datetime.now(timezone.utc).isoformat()
 
-    def _source_from_url(self, url: str) -> str:
-        from urllib.parse import urlparse
+    @staticmethod
+    def _clean_text(value: str) -> str:
+        return " ".join(value.replace("\n", " ").replace("\r", " ").split())
 
-        parsed = urlparse(url)
-        host = parsed.netloc.lower().replace("www.", "")
-        return host.split("/")[0] or "Unknown"
-
-    def _count_by_source(self, articles: List[Dict[str, Any]]) -> Dict[str, int]:
+    @staticmethod
+    def _count_by_source(articles: List[Dict[str, Any]]) -> Dict[str, int]:
         counts: Dict[str, int] = {}
         for article in articles:
             source = article.get("source", "Unknown")
             counts[source] = counts.get(source, 0) + 1
         return counts
 
-    def _mock_articles(self, limit: int = 3) -> List[Dict[str, Any]]:
-        now = datetime.utcnow().isoformat()
-        return [
-            {
-                "id": "mock-1",
-                "title": "Synthetic Global Briefing",
-                "description": "Fallback article generated because external sources were unavailable.",
-                "summary": "Fallback article generated because external sources were unavailable.",
-                "source": "SampleSource",
-                "url": "https://example.local/news/mock-1",
-                "published_at": now,
-                "location": {"name": "Global", "lat": None, "lon": None},
-                "raw_text": "Synthetic fallback content for resilience testing.",
-                "content": "Synthetic fallback content for resilience testing.",
-                "categories": ["General"],
-                "source_type": "mock",
-                "ingested_at": now,
-                "status": "pending",
-            },
-            {
-                "id": "mock-2",
-                "title": "Synthetic Economic Update",
-                "description": "Fallback economics signal for local/offline development.",
-                "summary": "Fallback economics signal for local/offline development.",
-                "source": "SampleSource",
-                "url": "https://example.local/news/mock-2",
-                "published_at": now,
-                "location": {"name": "Global", "lat": None, "lon": None},
-                "raw_text": "Economic scenario fallback record.",
-                "content": "Economic scenario fallback record.",
-                "categories": ["Economics"],
-                "source_type": "mock",
-                "ingested_at": now,
-                "status": "pending",
-            },
-            {
-                "id": "mock-3",
-                "title": "Synthetic Conflict Tracker",
-                "description": "Fallback conflict update for graph continuity.",
-                "summary": "Fallback conflict update for graph continuity.",
-                "source": "SampleSource",
-                "url": "https://example.local/news/mock-3",
-                "published_at": now,
-                "location": {"name": "Global", "lat": None, "lon": None},
-                "raw_text": "Conflict scenario fallback record.",
-                "content": "Conflict scenario fallback record.",
-                "categories": ["Defense"],
-                "source_type": "mock",
-                "ingested_at": now,
-                "status": "pending",
-            },
-        ][: max(1, limit)]
-
 
 news_ingestor = NewsIngestor()
 
+
+def load_feeds() -> List[Dict[str, str]]:
+    return [feed.__dict__ for feed in news_ingestor.load_feeds()]
+
+
+async def fetch_all_feeds_async() -> List[Tuple[Dict[str, str], int]]:
+    feeds = news_ingestor.load_feeds()
+    results, _ = await news_ingestor.fetch_all_feeds_async(feeds, limit_per_source=50)
+    return [(feed.__dict__, len(payload)) for feed, payload in results]
+
+
+def parse_articles(raw_feed_payloads: List[Tuple[FeedSource, bytes]]) -> List[Dict[str, Any]]:
+    parsed: List[Dict[str, Any]] = []
+    for feed, payload in raw_feed_payloads:
+        parsed.extend(news_ingestor.parse_articles(feed, payload, limit_per_source=50))
+    return parsed
+
+
+def deduplicate_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return news_ingestor.deduplicate_articles(articles)
+
+
+def normalize_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return news_ingestor.normalize_articles(articles)
+
+
+async def store_in_neo4j(articles: List[Dict[str, Any]]) -> int:
+    return await news_ingestor.store_in_neo4j(articles)
+
+
+async def _run_interval(minutes: int, limit_per_source: int, category: Optional[str]) -> None:
+    interval_seconds = max(1, minutes) * 60
+    while True:
+        await news_ingestor.ingest_all(limit_per_source=limit_per_source, category=category)
+        await asyncio.sleep(interval_seconds)
+
+
+def _configure_logging() -> None:
+    if logging.getLogger().handlers:
+        return
+
+    level_name = os.getenv("NEWS_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level_name, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Async news ingestion pipeline")
+    parser.add_argument("--limit", type=int, default=50, help="Max articles per source")
+    parser.add_argument("--category", type=str, default=None, help="Optional feed category filter")
+    parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        default=0,
+        help="If > 0, run continuously every X minutes",
+    )
+    return parser
+
+
+def main() -> None:
+    _configure_logging()
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+
+    if args.interval_minutes and args.interval_minutes > 0:
+        asyncio.run(_run_interval(args.interval_minutes, args.limit, args.category))
+    else:
+        asyncio.run(news_ingestor.ingest_all(limit_per_source=args.limit, category=args.category))
+
+
+if __name__ == "__main__":
+    main()

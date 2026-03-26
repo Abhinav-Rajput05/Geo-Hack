@@ -6,7 +6,7 @@ from loguru import logger
 from asgiref.sync import async_to_sync
 
 from app.tasks.celery_app import celery_app
-from app.ingestion.news_ingestor import news_ingestor
+from app.realtime.ingestion_pipeline import realtime_ingestion_pipeline
 
 
 @celery_app.task(name='app.tasks.ingestion.ingest_news')
@@ -23,10 +23,8 @@ def ingest_news(
     try:
         # Use async_to_sync instead of asyncio.run() to properly handle async code
         # from a synchronous Celery task without event loop conflicts
-        result = async_to_sync(news_ingestor.ingest_all)(
+        result = async_to_sync(realtime_ingestion_pipeline.run_once)(
             limit_per_source=limit,
-            keywords=keywords,
-            country=country,
             category=category,
         )
         logger.info(

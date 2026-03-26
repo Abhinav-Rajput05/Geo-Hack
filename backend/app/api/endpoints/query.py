@@ -9,7 +9,7 @@ from time import perf_counter
 from app.graphrag import graphrag_service
 from app.insights import insights_service
 from app.ontology import ontology_service
-from app.main import limiter
+from app.limiter import limiter
 
 router = APIRouter()
 

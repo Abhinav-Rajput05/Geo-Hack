@@ -34,7 +34,7 @@ function App() {
   }, []);
 
   const fetchSystemStatus = async () => {
-    const endpoint = '/api/v1/health';
+    const endpoint = '/health';
     try {
       const response = await fetch(endpoint, {
         headers: {

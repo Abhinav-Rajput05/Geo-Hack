@@ -3,6 +3,7 @@ Ontology Service - Core Knowledge Graph Operations
 """
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from neo4j.exceptions import Neo4jError
 from app.ontology.schema import Entity, EntityType, Relationship, RelationshipType
 from app.database.neo4j_client import neo4j_client
 
@@ -12,6 +13,15 @@ class OntologyService:
     
     def __init__(self):
         self.neo4j = neo4j_client
+
+    async def ensure_search_indexes(self) -> None:
+        """Ensure ontology search indexes exist (idempotent)."""
+        statements = [
+            "CREATE INDEX entity_name_idx IF NOT EXISTS FOR (e:Entity) ON (e.name)",
+            "CREATE FULLTEXT INDEX entity_name_ft IF NOT EXISTS FOR (e:Entity) ON EACH [e.name]",
+        ]
+        for statement in statements:
+            await self.neo4j.execute_write(statement)
     
     async def create_entity(self, entity: Entity) -> Dict[str, Any]:
         """Create a new entity in the knowledge graph"""
@@ -65,49 +75,39 @@ class OntologyService:
         if entity_type:
             params["entity_type"] = entity_type
         
-        # Try full-text index first (Medium #19), fallback to CONTAINS if index doesn't exist
-        cypher = """
-        // Try full-text index first
+        fulltext_cypher = """
         CALL db.index.fulltext.queryNodes('entity_name_ft', $query + '*') YIELD node, score
         WHERE ($entity_type IS NULL OR node.type = $entity_type)
         RETURN node as e, id(node) as node_id, score
         ORDER BY score DESC
         LIMIT $limit
         """
-        
+        contains_cypher = """
+        MATCH (e:Entity)
+        WHERE toLower(coalesce(e.name, '')) CONTAINS toLower($query)
+        """
+        if entity_type:
+            contains_cypher += " AND e.type = $entity_type"
+        contains_cypher += """
+        RETURN e, id(e) as node_id
+        ORDER BY e.name
+        LIMIT $limit
+        """
+
         try:
-            results = await self.neo4j.execute_query(cypher, parameters=params)
-            
-            # If full-text index doesn't exist, fall back to CONTAINS query
+            results = await self.neo4j.execute_query(fulltext_cypher, parameters=params)
             if not results:
-                cypher = """
-                MATCH (e:Entity)
-                WHERE e.name CONTAINS $query
-                """
-                if entity_type:
-                    cypher += " AND e.type = $entity_type"
-                
-                cypher += """
-                RETURN e, id(e) as node_id
-                ORDER BY e.name
-                LIMIT $limit
-                """
-                results = await self.neo4j.execute_query(cypher, parameters=params)
-        except Exception:
-            # Full-text index not available, use CONTAINS fallback
-            cypher = """
-            MATCH (e:Entity)
-            WHERE e.name CONTAINS $query
-            """
-            if entity_type:
-                cypher += " AND e.type = $entity_type"
-            
-            cypher += """
-            RETURN e, id(e) as node_id
-            ORDER BY e.name
-            LIMIT $limit
-            """
-            results = await self.neo4j.execute_query(cypher, parameters=params)
+                results = await self.neo4j.execute_query(contains_cypher, parameters=params)
+        except Neo4jError as exc:
+            error_code = getattr(exc, "code", "")
+            error_msg = str(exc)
+            missing_fulltext_index = (
+                error_code == "Neo.ClientError.Procedure.ProcedureCallFailed"
+                and "There is no such fulltext schema index" in error_msg
+            )
+            if not missing_fulltext_index:
+                raise
+            results = await self.neo4j.execute_query(contains_cypher, parameters=params)
         
         entities = []
         for row in results:
