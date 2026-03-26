@@ -98,6 +98,7 @@ async def get_ingestion_status():
     sources_active = (
         len(settings.rss_feeds)
         + (1 if settings.news_api_key else 0)
+        + (1 if settings.GNEWS_API_KEY else 0)
         + (1 if settings.GDELT_ENABLED else 0)
         + (1 if settings.EVENT_REGISTRY_API_KEY else 0)
     )
@@ -218,6 +219,18 @@ async def get_sources():
                 active=True,
                 last_fetch=None,
                 articles_count=source_counts.get("NewsAPI", 0),
+            )
+        )
+
+    if settings.GNEWS_API_KEY:
+        sources.append(
+            NewsSource(
+                name="GNews",
+                type="api",
+                url=settings.GNEWS_BASE_URL,
+                active=True,
+                last_fetch=None,
+                articles_count=source_counts.get("GNews", 0),
             )
         )
 

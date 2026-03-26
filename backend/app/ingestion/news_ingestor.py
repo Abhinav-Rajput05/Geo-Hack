@@ -40,6 +40,10 @@ class FeedSource:
 
 
 DEFAULT_FEEDS_PATH = Path(__file__).with_name("rss_feeds.json")
+TEMP_FEEDS = [
+    "http://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+]
 
 
 class NewsIngestor:
@@ -70,57 +74,34 @@ class NewsIngestor:
         country: Optional[str] = None,
         category: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Run end-to-end ingestion. Keeps interface compatible with existing task runner."""
+        """Run modular ingestion pipeline while preserving legacy response shape."""
         _ = (keywords, country)  # Reserved for future filters.
-        started_at = datetime.now(timezone.utc)
+        try:
+            from app.ingestion.pipeline import ingestion_pipeline
 
-        feeds = self.load_feeds(category=category)
-        feed_results, fetch_failures = await self.fetch_all_feeds_async(feeds, limit_per_source=limit_per_source)
-
-        parsed_articles: List[Dict[str, Any]] = []
-        for feed, payload in feed_results:
-            parsed_articles.extend(self.parse_articles(feed, payload, limit_per_source=limit_per_source))
-
-        newsapi_articles = await self._fetch_newsapi_async(limit_per_source=limit_per_source, category=category)
-        if newsapi_articles:
-            parsed_articles.extend(newsapi_articles)
-
-        deduplicated_articles = self.deduplicate_articles(parsed_articles)
-        normalized_articles = self.normalize_articles(deduplicated_articles)
-        stored_count = await self.store_in_neo4j(normalized_articles)
-        source_counts = self._count_by_source(normalized_articles)
-
-        total_feeds = len(feeds)
-        total_fetched = len(parsed_articles)
-        total_unique = len(normalized_articles)
-
-        logger.info(
-            "[SUMMARY] feeds_processed=%s fetched=%s unique=%s stored=%s failures=%s",
-            total_feeds,
-            total_fetched,
-            total_unique,
-            stored_count,
-            len(fetch_failures),
-        )
-
-        if total_fetched == 0:
-            logger.warning("[SUMMARY] 0 articles fetched from all configured sources")
-
-        duration_sec = round((datetime.now(timezone.utc) - started_at).total_seconds(), 3)
-        return {
-            "total_articles": total_fetched,
-            "unique_articles": total_unique,
-            "total_feeds_processed": total_feeds,
-            "total_articles_fetched": total_fetched,
-            "total_articles_unique": total_unique,
-            "persisted_to_neo4j": stored_count,
-            "source_failures": fetch_failures,
-            "source_counts": source_counts,
-            "sources": sorted({a["source"] for a in normalized_articles}) if normalized_articles else [],
-            "processing_seconds": duration_sec,
-            "ingested_at": datetime.now(timezone.utc).isoformat(),
-            "articles": normalized_articles,
-        }
+            result = await ingestion_pipeline.run_once(
+                limit_per_source=limit_per_source,
+                category=category,
+            )
+            result["total_articles_unique"] = result.get("unique_articles", 0)
+            return result
+        except Exception as e:
+            print(f"[ERROR] Feed failed: ingest_all, Error: {e}")
+            logger.error("[ERROR] Ingestion failed: %s", e)
+            return {
+                "total_articles": 0,
+                "unique_articles": 0,
+                "total_feeds_processed": 0,
+                "total_articles_fetched": 0,
+                "total_articles_unique": 0,
+                "persisted_to_neo4j": 0,
+                "source_failures": {"ingest_all": str(e)},
+                "source_counts": {},
+                "sources": [],
+                "processing_seconds": 0,
+                "ingested_at": datetime.now(timezone.utc).isoformat(),
+                "articles": [],
+            }
 
     def load_feeds(self, category: Optional[str] = None) -> List[FeedSource]:
         """Load feed list from JSON config with fallback to settings.RSS_FEEDS."""
@@ -146,7 +127,8 @@ class NewsIngestor:
                 logger.error("[ERROR] Failed to load feeds config from %s: %s", config_path, exc)
 
         if not loaded_feeds:
-            for url in getattr(settings, "RSS_FEEDS", []):
+            fallback_urls = list(getattr(settings, "RSS_FEEDS", [])) or TEMP_FEEDS
+            for url in fallback_urls:
                 if isinstance(url, str) and url.strip():
                     loaded_feeds.append(FeedSource(name=url, url=url.strip(), category="general"))
 
@@ -164,7 +146,7 @@ class NewsIngestor:
     ) -> Tuple[List[Tuple[FeedSource, bytes]], Dict[str, str]]:
         """Fetch all RSS feeds in parallel with retry and timeout handling."""
         timeout = aiohttp.ClientTimeout(total=self.fetch_timeout_seconds)
-        headers = {"User-Agent": "global-ontology-engine/3.0"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         connector = aiohttp.TCPConnector(limit=self.max_concurrent_fetches, ttl_dns_cache=300)
 
         results: List[Tuple[FeedSource, bytes]] = []
@@ -199,12 +181,14 @@ class NewsIngestor:
         """Fetch one feed with retries, timeout safety, and basic rate limiting."""
         _ = limit_per_source  # kept for future provider-specific query params
         logger.info("[INGEST] Fetching feed: %s", feed.name)
+        print(f"[DEBUG] Fetching feed: {feed.url}")
 
         for attempt in range(1, self.fetch_retries + 1):
             try:
                 async with self._fetch_semaphore:
                     await self._apply_rate_limit()
                     async with session.get(feed.url) as response:
+                        print(f"[DEBUG] Status code: {response.status}")
                         response.raise_for_status()
                         payload = await response.read()
 
@@ -245,6 +229,7 @@ class NewsIngestor:
         articles: List[Dict[str, Any]] = []
         try:
             parsed = feedparser.parse(payload)
+            print(f"[DEBUG] Entries found: {len(parsed.entries or [])}")
             if getattr(parsed, "bozo", 0):
                 logger.warning("[ERROR] Feed has parsing warnings: %s", feed.name)
 
@@ -344,9 +329,19 @@ class NewsIngestor:
             MERGE (a)-[:PUBLISHED_BY]->(s)
             MERGE (c:Category {name: article.category})
             MERGE (a)-[:IN_CATEGORY]->(c)
+            MERGE (e:Entity {name: article.title, type: 'Event'})
+            ON CREATE SET e.created_at = datetime()
+            SET e.updated_at = datetime(),
+                e.source = article.source,
+                e.url = article.url
+            MERGE (a)-[:DESCRIBES]->(e)
             """
             await neo4j_client.execute_write(query=query, parameters={"articles": articles})
             logger.info("[DB] Inserted %s articles into Neo4j", len(articles))
+            for article in articles:
+                name = article.get("title", "")
+                if name:
+                    print(f"[DEBUG] Inserted entity: {name}")
             return len(articles)
         except Exception as exc:
             logger.error("[DB] Neo4j persistence failed: %s", exc)
@@ -381,7 +376,7 @@ class NewsIngestor:
             params["category"] = category.lower()
 
         timeout = aiohttp.ClientTimeout(total=self.fetch_timeout_seconds)
-        headers = {"User-Agent": "global-ontology-engine/3.0"}
+        headers = {"User-Agent": "Mozilla/5.0"}
 
         for attempt in range(1, self.fetch_retries + 1):
             try:

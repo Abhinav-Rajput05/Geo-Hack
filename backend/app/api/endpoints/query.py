@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from time import perf_counter
+from loguru import logger
 
 from app.graphrag import graphrag_service
 from app.insights import insights_service
@@ -80,6 +81,7 @@ async def query_ontology(request: Request, query_request: QueryRequest):
             risk_data = await insights_service.get_risk_analysis(category=query_request.domain)
             
     except Exception as e:
+        logger.exception(f"/api/v1/query failed: {e}")
         raise HTTPException(status_code=500, detail=f"Query processing failed: {e}") from e
 
     supporting_facts = rag_result.get("supporting_facts", [])
@@ -91,7 +93,7 @@ async def query_ontology(request: Request, query_request: QueryRequest):
     for entity in rag_result.get("related_entities", []):
         name = entity.get("name", "Unknown")
         entity_type = entity.get("type", "Unknown")
-        confidence = float(entity.get("confidence", 0.7))
+        confidence = _safe_float(entity.get("confidence", 0.7), 0.7)
         entities.append(
             EntityReference(
                 name=name,
@@ -100,7 +102,7 @@ async def query_ontology(request: Request, query_request: QueryRequest):
             )
         )
 
-    confidence_score = float(rag_result.get("confidence", 0.0))
+    confidence_score = _safe_float(rag_result.get("confidence", 0.0), 0.0)
     if confidence_score >= 0.75:
         confidence_level = "high"
     elif confidence_score >= 0.45:
@@ -188,3 +190,12 @@ async def get_query_suggestions(prefix: str, limit: int = 5):
             "suggestions": [],
             "error": str(e)
         }
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default

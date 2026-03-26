@@ -5,6 +5,29 @@
 .pdf
 
 node_modules/
+.env# Node.js
+node_modules/
+frontend/node_modules/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Environment variables
 .env
+
+# Build / logs
+dist/
+build/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
 dist/
 build/

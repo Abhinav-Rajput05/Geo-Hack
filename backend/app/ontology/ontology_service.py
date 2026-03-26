@@ -26,7 +26,10 @@ class OntologyService:
     async def create_entity(self, entity: Entity) -> Dict[str, Any]:
         """Create a new entity in the knowledge graph"""
         query = """
-        MERGE (e:Entity {name: $name, type: $type})
+        CREATE (e:Entity {
+            name: $name,
+            type: $type
+        })
         SET e += $properties,
             e.description = $description,
             e.confidence = $confidence,
@@ -46,6 +49,7 @@ class OntologyService:
             created_at=entity.created_at.isoformat(),
             updated_at=entity.updated_at.isoformat()
         )
+        print(f"[DEBUG] Inserted entity: {entity.name}")
         return result[0] if result else None
     
     async def get_entity(self, entity_id: str) -> Optional[Dict[str, Any]]:
@@ -69,15 +73,18 @@ class OntologyService:
         limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Search entities by name or type"""
+        if not query:
+            return []
         
-        # Fixed entity_type parameter handling - only include when provided (Medium #22)
-        params = {"query": query, "limit": limit}
-        if entity_type:
-            params["entity_type"] = entity_type
+        params = {
+            "query": query,
+            "limit": limit,
+            "entity_type": entity_type if entity_type else None
+        }
         
         fulltext_cypher = """
         CALL db.index.fulltext.queryNodes('entity_name_ft', $query + '*') YIELD node, score
-        WHERE ($entity_type IS NULL OR node.type = $entity_type)
+        WHERE ($entity_type IS NULL OR coalesce(node.type, '') = $entity_type)
         RETURN node as e, id(node) as node_id, score
         ORDER BY score DESC
         LIMIT $limit
@@ -98,15 +105,8 @@ class OntologyService:
             results = await self.neo4j.execute_query(fulltext_cypher, parameters=params)
             if not results:
                 results = await self.neo4j.execute_query(contains_cypher, parameters=params)
-        except Neo4jError as exc:
-            error_code = getattr(exc, "code", "")
-            error_msg = str(exc)
-            missing_fulltext_index = (
-                error_code == "Neo.ClientError.Procedure.ProcedureCallFailed"
-                and "There is no such fulltext schema index" in error_msg
-            )
-            if not missing_fulltext_index:
-                raise
+        except (Neo4jError, Exception) as exc:
+            print(f"[WARN] Full-text index failed: {exc}")
             results = await self.neo4j.execute_query(contains_cypher, parameters=params)
         
         entities = []
@@ -216,16 +216,18 @@ class OntologyService:
     ) -> Dict[str, Any]:
         """Get a subgraph centered on an entity for visualization"""
         
-        # Clamp depth to prevent performance issues (Medium #16)
-        clamped_depth = max(1, min(int(depth), 5))
-        
-        # Validate depth is a positive integer
-        if clamped_depth < 1:
-            raise ValueError("Depth must be a positive integer")
+        # Cypher does not allow parameterized variable-length depth (e.g. *1..$depth),
+        # so we validate and embed a bounded literal depth in the query string.
+        try:
+            clamped_depth = int(depth)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Depth must be an integer") from exc
+
+        clamped_depth = max(1, min(clamped_depth, 5))
         
         # Get connected nodes at specified depth
-        query = """
-        MATCH path = (e:Entity)-[r*1..$depth]->(connected)
+        query = f"""
+        MATCH path = (e:Entity)-[r*1..{clamped_depth}]->(connected)
         WHERE toString(id(e)) = $entity_id OR e.name = $entity_id
         WITH nodes(path) as nodes, relationships(path) as rels
         UNWIND nodes as n
@@ -249,7 +251,6 @@ class OntologyService:
         result = await self.neo4j.execute_query(
             query,
             entity_id=str(entity_id),
-            depth=clamped_depth,
             limit=limit
         )
         

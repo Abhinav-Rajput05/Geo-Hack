@@ -250,6 +250,13 @@ async def search_entities(
     """
     Search entities in the knowledge graph
     """
+    if not query:
+        return {
+            "query": query,
+            "results": [],
+            "total": 0,
+        }
+
     try:
         results = await ontology_service.search_entities(
             query=query,

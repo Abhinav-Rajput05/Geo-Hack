@@ -120,24 +120,34 @@ Example output: ["United States", "NATO", "China"]"""
         all_relationships = []
 
         for entity_name in entities:
-            # Get related entities
-            related = await ontology_service.get_related_entities(
-                entity_name, limit=self.top_k
-            )
-            all_entities.extend(related)
+            try:
+                # Get related entities
+                related = await ontology_service.get_related_entities(
+                    entity_name, limit=self.top_k
+                )
+                all_entities.extend(related)
+            except Exception as exc:
+                logger.warning(f"Graph context related-entity lookup failed for '{entity_name}': {exc}")
 
-            # Get relationships
-            rels = await ontology_service.get_relationships(
-                entity_name, direction="both", limit=10
-            )
-            all_relationships.extend(rels)
+            try:
+                # Get relationships
+                rels = await ontology_service.get_relationships(
+                    entity_name, direction="both", limit=10
+                )
+                all_relationships.extend(rels)
+            except Exception as exc:
+                logger.warning(f"Graph context relationship lookup failed for '{entity_name}': {exc}")
 
         # Get subgraph for first entity if available
         subgraph = {}
         if entities:
-            subgraph = await ontology_service.get_entity_subgraph(
-                entities[0], depth=self.max_hops, limit=50
-            )
+            try:
+                subgraph = await ontology_service.get_entity_subgraph(
+                    entities[0], depth=self.max_hops, limit=50
+                )
+            except Exception as exc:
+                logger.warning(f"Graph context subgraph lookup failed for '{entities[0]}': {exc}")
+                subgraph = {}
 
         vector_texts = []
         vector_metadata = []

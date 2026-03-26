@@ -40,19 +40,17 @@ class Settings(BaseSettings):
     
     # News APIs
     NEWS_API_KEY: Optional[str] = None
+    GNEWS_API_KEY: Optional[str] = None
+    GNEWS_BASE_URL: str = "https://gnews.io/api/v4/top-headlines"
     EVENT_REGISTRY_API_KEY: Optional[str] = None
     GDELT_ENABLED: bool = True
     
     # RSS Feed Sources
     RSS_FEEDS: list = [
-        "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-        "https://www.reutersagency.com/feed/?taxonomy=best-topics&post_type=best",
-        "https://www.aljazeera.com/xml/rss/all.xml",
-        "https://feeds.npr.org/1004/rss.xml",
-        "https://www.theguardian.com/world/rss",
-        "https://www.dw.com/en/top-stories/rss",
-        "https://www.france24.com/en/rss"
+        "https://feeds.reuters.com/reuters/topNews",
+        "https://feeds.bbci.co.uk/news/rss.xml",
+        "https://feeds.reuters.com/reuters/businessNews",
+        "https://feeds.reuters.com/reuters/worldNews",
     ]
     
     # Data Ingestion Settings

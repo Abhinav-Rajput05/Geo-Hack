@@ -22,6 +22,15 @@ from app.realtime.websocket_server import ws_router
 from app.ontology import ontology_service
 
 
+async def create_fulltext_indexes() -> None:
+    query = """
+    CREATE FULLTEXT INDEX entity_name_ft IF NOT EXISTS
+    FOR (n:Entity)
+    ON EACH [n.name];
+    """
+    await neo4j_client.execute_query(query)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events"""
@@ -34,6 +43,7 @@ async def lifespan(app: FastAPI):
         logger.info("Neo4j connection established")
         try:
             await ontology_service.ensure_search_indexes()
+            await create_fulltext_indexes()
             logger.info("Ontology search indexes ensured")
         except Exception as e:
             logger.warning(f"Failed to ensure ontology search indexes: {e}")
@@ -110,6 +120,16 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+
+@app.on_event("startup")
+async def create_indexes():
+    try:
+        if not neo4j_client.driver:
+            await neo4j_client.connect()
+        await create_fulltext_indexes()
+    except Exception as e:
+        logger.warning(f"Failed to create startup full-text index: {e}")
 
 # Import limiter after app creation to avoid circular import
 from app.limiter import limiter
