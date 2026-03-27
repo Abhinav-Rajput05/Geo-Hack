@@ -3,6 +3,7 @@ Frontend Alignment API Endpoints
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -23,6 +24,8 @@ router = APIRouter()
 FRONTEND_CACHE_TTL = 120
 RISK_TABLE = "risk_timeline_snapshots"
 CHAT_TABLE = "analysis_chat_history"
+_tables_initialized = False
+_tables_lock = asyncio.Lock()
 
 
 def ok(data: Any, message: str = "") -> Dict[str, Any]:
@@ -41,35 +44,92 @@ def error(message: str, status_code: int = 500) -> None:
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1)
     country: str = "India"
+    session_id: Optional[str] = None
     include_map_data: bool = False
     include_risk_analysis: bool = False
 
 
 async def _ensure_frontend_tables() -> None:
-    await postgres_client.execute_write(
+    global _tables_initialized
+    if _tables_initialized:
+        return
+
+    async with _tables_lock:
+        if _tables_initialized:
+            return
+
+        await postgres_client.execute_write(
+            f"""
+            CREATE TABLE IF NOT EXISTS {RISK_TABLE} (
+                id SERIAL PRIMARY KEY,
+                country VARCHAR(120) NOT NULL,
+                snapshot_date DATE NOT NULL,
+                score NUMERIC(4,2) NOT NULL,
+                event_text TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(country, snapshot_date)
+            );
+            """
+        )
+        await postgres_client.execute_write(
+            f"""
+            CREATE TABLE IF NOT EXISTS {CHAT_TABLE} (
+                id SERIAL PRIMARY KEY,
+                session_id VARCHAR(120),
+                country VARCHAR(120) NOT NULL,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        await postgres_client.execute_write(
+            f"""
+            ALTER TABLE {CHAT_TABLE}
+            ADD COLUMN IF NOT EXISTS session_id VARCHAR(120);
+            """
+        )
+        _tables_initialized = True
+
+
+def _normalize_session_id(session_id: Optional[str]) -> str:
+    value = (session_id or "").strip()
+    if not value:
+        return "default"
+    return value[:120]
+
+
+def _normalize_question(question: str) -> str:
+    value = (question or "").strip()
+    if not value:
+        raise ValueError("Question must not be empty")
+    if len(value) > 2000:
+        raise ValueError("Question must be 2000 characters or fewer")
+    return value
+
+
+async def _load_chat_context(session_id: str, country: str, limit: int = 6) -> List[Dict[str, str]]:
+    await _ensure_frontend_tables()
+    rows = await postgres_client.execute_query(
         f"""
-        CREATE TABLE IF NOT EXISTS {RISK_TABLE} (
-            id SERIAL PRIMARY KEY,
-            country VARCHAR(120) NOT NULL,
-            snapshot_date DATE NOT NULL,
-            score NUMERIC(4,2) NOT NULL,
-            event_text TEXT,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(country, snapshot_date)
-        );
-        """
+        SELECT question, answer
+        FROM {CHAT_TABLE}
+        WHERE session_id = :session_id AND country = :country
+        ORDER BY created_at DESC
+        LIMIT :limit
+        """,
+        {"session_id": session_id, "country": country, "limit": max(1, min(limit, 20))},
     )
-    await postgres_client.execute_write(
-        f"""
-        CREATE TABLE IF NOT EXISTS {CHAT_TABLE} (
-            id SERIAL PRIMARY KEY,
-            country VARCHAR(120) NOT NULL,
-            question TEXT NOT NULL,
-            answer TEXT NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        """
-    )
+    rows.reverse()
+    history: List[Dict[str, str]] = []
+    for row in rows:
+        question = str(row.get("question") or "").strip()
+        answer = str(row.get("answer") or "").strip()
+        if question:
+            history.append({"role": "user", "content": question})
+        if answer:
+            history.append({"role": "assistant", "content": answer})
+    return history
 
 
 def _safe_date(value: Optional[str]) -> Optional[date]:
@@ -469,24 +529,29 @@ async def _get_or_seed_risk_timeline(country: str, days: int, articles: List[Dic
             if published not in event_by_day:
                 event_by_day[published] = article.get("title", "News event")
 
+        rows_to_seed: List[Dict[str, Any]] = []
         for offset in range(days):
             day = start_day + timedelta(days=offset)
             score = round(base_score + ((offset % 7) - 3) * 0.15, 1)
             event_text = event_by_day.get(day)
-            await postgres_client.execute_write(
-                f"""
-                INSERT INTO {RISK_TABLE} (country, snapshot_date, score, event_text)
-                VALUES (:country, :snapshot_date, :score, :event_text)
-                ON CONFLICT (country, snapshot_date)
-                DO UPDATE SET score = EXCLUDED.score, event_text = COALESCE(EXCLUDED.event_text, {RISK_TABLE}.event_text)
-                """,
+            rows_to_seed.append(
                 {
                     "country": country,
                     "snapshot_date": day,
                     "score": score,
                     "event_text": event_text,
-                },
+                }
             )
+
+        await postgres_client.execute_write_many(
+            f"""
+            INSERT INTO {RISK_TABLE} (country, snapshot_date, score, event_text)
+            VALUES (:country, :snapshot_date, :score, :event_text)
+            ON CONFLICT (country, snapshot_date)
+            DO UPDATE SET score = EXCLUDED.score, event_text = COALESCE(EXCLUDED.event_text, {RISK_TABLE}.event_text)
+            """,
+            rows_to_seed,
+        )
 
         rows = await postgres_client.execute_query(
             f"""
@@ -546,33 +611,58 @@ async def get_analysis(country: str) -> Dict[str, Any]:
 @router.post("/analysis/chat")
 async def analysis_chat(request: ChatRequest) -> Dict[str, Any]:
     normalized_country = _normalize_country_name(request.country)
+    session_id = _normalize_session_id(request.session_id)
     try:
-        rag_result = await graphrag_service.query(request.question)
+        normalized_question = _normalize_question(request.question)
+        conversation_history = await _load_chat_context(
+            session_id=session_id,
+            country=normalized_country,
+            limit=4,
+        )
+        rag_result = await graphrag_service.query(
+            normalized_question,
+            conversation_history=conversation_history,
+        )
         answer = rag_result.get("answer", "No answer available.")
         sources = rag_result.get("sources", [])
+        confidence_score = float(rag_result.get("confidence", 0.0) or 0.0)
+        if confidence_score >= 0.75:
+            confidence = "high"
+        elif confidence_score >= 0.45:
+            confidence = "medium"
+        else:
+            confidence = "low"
 
         await _ensure_frontend_tables()
         await postgres_client.execute_write(
             f"""
-            INSERT INTO {CHAT_TABLE} (country, question, answer)
-            VALUES (:country, :question, :answer)
+            INSERT INTO {CHAT_TABLE} (session_id, country, question, answer)
+            VALUES (:session_id, :country, :question, :answer)
             """,
             {
+                "session_id": session_id,
                 "country": normalized_country,
-                "question": request.question,
+                "question": normalized_question,
                 "answer": answer,
             },
         )
 
         response_payload = {
-            "question": request.question,
+            "question": normalized_question,
             "country": normalized_country,
+            "session_id": session_id,
             "answer": answer,
             "reasoning_chain": rag_result.get("reasoning_chain", []),
             "supporting_facts": rag_result.get("supporting_facts", []),
             "sources": sources,
+            "context_used": rag_result.get("context_used", ""),
+            "confidence": confidence,
+            "confidence_score": confidence_score,
+            "data_sources": rag_result.get("data_sources", []),
         }
         return ok(response_payload, "Query answered")
+    except ValueError as exc:
+        error(str(exc), 422)
     except Exception as exc:
         logger.exception(f"Failed to answer chat query: {exc}")
         error("Failed to process chat query", 500)

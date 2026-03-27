@@ -43,7 +43,7 @@ A real-time knowledge graph system that ingests multi-domain data (geopolitics, 
 
 5. Run backend API:
    ```powershell
-   uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+   1
    ```
 
 6. In a second terminal, run Celery worker:

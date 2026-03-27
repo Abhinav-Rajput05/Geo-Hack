@@ -1,6 +1,7 @@
 """
 News API Endpoints - Live News Ingestion and Management
 """
+import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from uuid import uuid4
@@ -11,6 +12,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from app.config import settings
+from app.database.postgres_client import postgres_client
 from app.database.redis_client import redis_client
 from app.realtime.ingestion_pipeline import realtime_ingestion_pipeline
 from app.vectorstore import chroma_service
@@ -21,6 +23,7 @@ router = APIRouter()
 NEWS_CACHE_KEY = "news:articles:v1"
 NEWS_STATUS_KEY = "news:status:v1"
 NEWS_CACHE_TTL_SECONDS = 300
+ARTICLES_TABLE = "articles"
 
 
 class NewsArticle(BaseModel):
@@ -325,6 +328,11 @@ async def _load_or_refresh_articles() -> List[Dict[str, Any]]:
     if isinstance(cached, list) and cached:
         return cached
 
+    stored = await _load_articles_from_postgres(limit=300)
+    if stored:
+        await redis_client.set(NEWS_CACHE_KEY, stored, expire=NEWS_CACHE_TTL_SECONDS)
+        return stored
+
     result = await _refresh_articles()
     return result.get("articles", [])
 
@@ -338,6 +346,8 @@ async def _refresh_articles() -> Dict[str, Any]:
     )
     ingestion = await realtime_ingestion_pipeline.run_once(limit_per_source=30)
     normalized = [_normalize_article(article) for article in ingestion.get("articles", [])]
+    await _ensure_articles_table()
+    await _persist_articles_to_postgres(normalized)
     logger.info(
         "News refresh fetched "
         f"{ingestion.get('unique_articles', 0)} unique articles "
@@ -356,15 +366,31 @@ async def _refresh_articles() -> Dict[str, Any]:
     )
 
     try:
-        texts = [
-            f"{item.get('title', '')}\n{item.get('summary', '')}\n{item.get('content', '')}"
-            for item in normalized
-        ]
-        metadatas = [
-            {"source": item.get("source", "news"), "url": item.get("url", "")}
-            for item in normalized
-        ]
-        await chroma_service.add_documents(texts, metadatas)
+        texts: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
+        for item in normalized:
+            base_text = (
+                f"Title: {item.get('title', '')}\n"
+                f"Summary: {item.get('summary', '')}\n"
+                f"Content: {item.get('content', '')}"
+            )
+            chunks = _chunk_text(base_text, chunk_size=950, overlap=140)
+            for idx, chunk in enumerate(chunks):
+                texts.append(chunk)
+                metadatas.append(
+                    {
+                        "source": item.get("source", "news"),
+                        "url": item.get("url", ""),
+                        "article_id": item.get("id", ""),
+                        "domain": item.get("domain", ""),
+                        "region": item.get("region", ""),
+                        "published_at": item.get("published_at", ""),
+                        "chunk_index": idx,
+                        "chunk_total": len(chunks),
+                    }
+                )
+        if texts:
+            await chroma_service.add_documents(texts, metadatas)
     except Exception:
         pass
 
@@ -374,6 +400,7 @@ async def _refresh_articles() -> Dict[str, Any]:
 
 
 def _normalize_article(article: Dict[str, Any]) -> Dict[str, Any]:
+    article_id = article.get("id") or str(uuid4())
     title = article.get("title", "Untitled")
     summary = article.get("summary", "")
     content = article.get("content")
@@ -383,12 +410,12 @@ def _normalize_article(article: Dict[str, Any]) -> Dict[str, Any]:
         categories = [str(article.get("category"))]
 
     return {
-        "id": article.get("id") or str(uuid4()),
+        "id": article_id,
         "title": title,
         "summary": summary,
         "content": content,
         "source": article.get("source", "Unknown"),
-        "url": article.get("url", ""),
+        "url": article.get("url") or f"urn:article:{article_id}",
         "published_at": article.get("published_at") or datetime.utcnow().isoformat(),
         "categories": categories,
         "domain": article.get("domain") or article.get("topic") or (categories[0] if categories else "General"),
@@ -400,6 +427,194 @@ def _normalize_article(article: Dict[str, Any]) -> Dict[str, Any]:
         "source_credibility": article.get("source_credibility"),
         "event_key": article.get("event_key"),
     }
+
+
+async def _ensure_articles_table() -> None:
+    await postgres_client.execute_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {ARTICLES_TABLE} (
+            id VARCHAR(255) PRIMARY KEY,
+            title TEXT NOT NULL,
+            summary TEXT,
+            content TEXT,
+            source VARCHAR(255) NOT NULL,
+            url TEXT UNIQUE,
+            published_at TIMESTAMP NOT NULL,
+            categories JSONB,
+            entities JSONB,
+            domain VARCHAR(100),
+            region VARCHAR(100),
+            sentiment VARCHAR(50),
+            relevance_score DOUBLE PRECISION,
+            source_credibility DOUBLE PRECISION,
+            event_key VARCHAR(255),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    # Keep schema aligned with JSON payloads even for pre-existing tables.
+    column_types = await postgres_client.execute_query(
+        """
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_name = :table_name
+          AND column_name IN ('categories', 'entities')
+        """,
+        {"table_name": ARTICLES_TABLE},
+    )
+    type_map = {row["column_name"]: row["data_type"] for row in column_types}
+
+    if type_map.get("categories") != "jsonb":
+        await postgres_client.execute_write(
+            f"""
+            ALTER TABLE {ARTICLES_TABLE}
+            ALTER COLUMN categories TYPE JSONB
+            USING CASE
+                WHEN categories IS NULL THEN '[]'::jsonb
+                ELSE to_jsonb(categories)
+            END;
+            """
+        )
+
+    if type_map.get("entities") != "jsonb":
+        await postgres_client.execute_write(
+            f"""
+            ALTER TABLE {ARTICLES_TABLE}
+            ALTER COLUMN entities TYPE JSONB
+            USING CASE
+                WHEN entities IS NULL THEN '[]'::jsonb
+                ELSE entities::jsonb
+            END;
+            """
+        )
+
+
+def validate_article(article: Dict[str, Any]) -> None:
+    assert isinstance(article["title"], str)
+    assert isinstance(article["url"], str)
+    assert isinstance(article.get("categories", []), list)
+    assert isinstance(article.get("entities", []), list)
+    assert isinstance(article.get("relevance_score", 0) or 0, (int, float))
+
+
+async def _persist_articles_to_postgres(articles: List[Dict[str, Any]]) -> None:
+    if not articles:
+        return
+
+    rows: List[Dict[str, Any]] = []
+    for item in articles:
+        validate_article(item)
+        published = _parse_datetime(item.get("published_at")) or datetime.utcnow()
+        categories = item.get("categories", [])
+        entities = item.get("entities", [])
+        logger.debug(f"Inserting article: {item.get('url')}")
+        logger.debug(f"Entities type: {type(entities)}")
+        rows.append(
+            {
+                "id": str(item.get("id", uuid4())),
+                "title": item.get("title", "Untitled"),
+                "summary": item.get("summary"),
+                "content": item.get("content"),
+                "source": item.get("source", "Unknown"),
+                "url": item.get("url"),
+                "published_at": published,
+                "categories": json.dumps(categories),
+                "entities": json.dumps(entities),
+                "domain": item.get("domain"),
+                "region": item.get("region"),
+                "sentiment": item.get("sentiment"),
+                "relevance_score": item.get("relevance_score"),
+                "source_credibility": item.get("source_credibility"),
+                "event_key": item.get("event_key"),
+            }
+        )
+
+    await postgres_client.execute_write_many(
+        f"""
+        INSERT INTO {ARTICLES_TABLE}
+        (id, title, summary, content, source, url, published_at, categories, entities, domain, region, sentiment, relevance_score, source_credibility, event_key)
+        VALUES
+        (:id, :title, :summary, :content, :source, :url, :published_at, CAST(:categories AS JSONB), CAST(:entities AS JSONB), :domain, :region, :sentiment, :relevance_score, :source_credibility, :event_key)
+        ON CONFLICT (url)
+        DO UPDATE SET
+            title = EXCLUDED.title,
+            summary = EXCLUDED.summary,
+            content = EXCLUDED.content,
+            source = EXCLUDED.source,
+            published_at = EXCLUDED.published_at,
+            categories = EXCLUDED.categories,
+            entities = EXCLUDED.entities,
+            domain = EXCLUDED.domain,
+            region = EXCLUDED.region,
+            sentiment = EXCLUDED.sentiment,
+            relevance_score = EXCLUDED.relevance_score,
+            source_credibility = EXCLUDED.source_credibility,
+            event_key = EXCLUDED.event_key,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        rows,
+    )
+
+
+async def _load_articles_from_postgres(limit: int = 100) -> List[Dict[str, Any]]:
+    try:
+        await _ensure_articles_table()
+        records = await postgres_client.execute_query(
+            f"""
+            SELECT id, title, summary, content, source, url, published_at, categories, entities,
+                   domain, region, sentiment, relevance_score, source_credibility, event_key
+            FROM {ARTICLES_TABLE}
+            ORDER BY published_at DESC
+            LIMIT :limit
+            """,
+            {"limit": max(1, limit)},
+        )
+    except Exception as exc:
+        logger.warning(f"Failed loading articles from PostgreSQL: {exc}")
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for row in records:
+        published = row.get("published_at")
+        categories = row.get("categories", []) or []
+        entities = row.get("entities", []) or []
+        if isinstance(categories, str):
+            try:
+                categories = json.loads(categories)
+            except Exception:
+                categories = []
+        if isinstance(entities, str):
+            try:
+                entities = json.loads(entities)
+            except Exception:
+                entities = []
+        published_at = (
+            published.isoformat()
+            if isinstance(published, datetime)
+            else str(published or datetime.utcnow().isoformat())
+        )
+        normalized.append(
+            {
+                "id": str(row.get("id", uuid4())),
+                "title": row.get("title", "Untitled"),
+                "summary": row.get("summary", ""),
+                "content": row.get("content"),
+                "source": row.get("source", "Unknown"),
+                "url": row.get("url", ""),
+                "published_at": published_at,
+                "categories": categories,
+                "entities": entities,
+                "domain": row.get("domain"),
+                "region": row.get("region", "Global"),
+                "sentiment": row.get("sentiment"),
+                "relevance_score": row.get("relevance_score"),
+                "source_credibility": row.get("source_credibility"),
+                "event_key": row.get("event_key"),
+                "location": {"name": row.get("region", "Global")},
+            }
+        )
+    return normalized
 
 
 def _to_news_article(article: Dict[str, Any]) -> NewsArticle:
@@ -500,3 +715,23 @@ def _host_from_url(url: str) -> str:
 
     host = urlparse(url).netloc.lower().replace("www.", "")
     return host or url
+
+
+def _chunk_text(text: str, chunk_size: int = 900, overlap: int = 120) -> List[str]:
+    """Split long text into overlapping chunks for better semantic retrieval."""
+    clean = (text or "").strip()
+    if not clean:
+        return []
+    if len(clean) <= chunk_size:
+        return [clean]
+
+    chunks: List[str] = []
+    start = 0
+    step = max(1, chunk_size - overlap)
+    while start < len(clean):
+        end = start + chunk_size
+        chunks.append(clean[start:end])
+        if end >= len(clean):
+            break
+        start += step
+    return chunks

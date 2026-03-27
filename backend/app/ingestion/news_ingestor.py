@@ -334,13 +334,16 @@ class NewsIngestor:
 
             query = """
             UNWIND $articles AS article
-            MERGE (a:Article {id: article.id})
+            MERGE (a:Article {url: article.url})
             ON CREATE SET a.created_at = datetime()
-            SET a.title = article.title,
-                a.summary = article.summary,
-                a.url = article.url,
-                a.published_at = article.published_at,
-                a.updated_at = datetime()
+            SET a += {
+                id: article.id,
+                title: article.title,
+                summary: article.summary,
+                url: article.url,
+                published_at: article.published_at,
+                updated_at: datetime()
+            }
             MERGE (s:Source {name: article.source})
             MERGE (a)-[:PUBLISHED_BY]->(s)
             MERGE (c:Category {name: article.category})

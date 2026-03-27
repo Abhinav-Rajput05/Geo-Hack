@@ -38,7 +38,11 @@ class RedisEventConsumer:
                     if not raw:
                         continue
 
-                    event = json.loads(raw)
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        logger.warning("[EVENT] Invalid JSON payload received on %s", self.channel)
+                        continue
                     await ws_manager.broadcast(event)
             except Exception as exc:
                 logger.error("[ERROR] Redis consumer failure: %s", exc)

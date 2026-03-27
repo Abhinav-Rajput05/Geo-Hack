@@ -52,9 +52,15 @@ async def lifespan(app: FastAPI):
 
     try:
         await postgres_client.connect()
+        from app.api.endpoints.frontend import _ensure_frontend_tables
+        from app.api.endpoints.news import _ensure_articles_table
+
+        await _ensure_frontend_tables()
+        await _ensure_articles_table()
         logger.info("PostgreSQL connection established")
     except Exception as e:
-        logger.warning(f"Failed to connect to PostgreSQL: {e}")
+        logger.error(f"Failed to connect to PostgreSQL: {e}")
+        raise
 
     try:
         await redis_client.connect()

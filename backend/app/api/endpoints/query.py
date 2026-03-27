@@ -2,7 +2,7 @@
 Query API Endpoints - GraphRAG Question Answering
 """
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from time import perf_counter
 from loguru import logger
@@ -17,12 +17,13 @@ router = APIRouter()
 
 class QueryRequest(BaseModel):
     """Query request model"""
-    question: str
+    question: str = Field(min_length=1, max_length=2000)
     domain: Optional[str] = None  # geopolitics, economics, defense, technology, climate, society
     max_hops: Optional[int] = 3
     include_sources: Optional[bool] = True
     include_map_data: Optional[bool] = False  # Optional, expensive operation
     include_risk_analysis: Optional[bool] = False  # Optional, expensive operation
+    conversation_history: Optional[List[Dict[str, str]]] = None
 
 
 class EntityReference(BaseModel):
@@ -42,8 +43,12 @@ class AnswerExplanation(BaseModel):
 
 class QueryResponse(BaseModel):
     """Query response model"""
+    status: str = "success"
     question: str
+    response: str
     answer: str
+    context: List[Dict[str, Any]] = []
+    metadata: Dict[str, Any] = {}
     explanation: AnswerExplanation
     entities: List[EntityReference]
     relationships: List[Dict[str, Any]]
@@ -67,8 +72,15 @@ async def query_ontology(request: Request, query_request: QueryRequest):
     - Source citations
     """
     started = perf_counter()
+    normalized_question = (query_request.question or "").strip()
+    if not normalized_question:
+        raise HTTPException(status_code=422, detail="Question must not be empty")
+
     try:
-        rag_result = await graphrag_service.query(query_request.question)
+        rag_result = await graphrag_service.query(
+            normalized_question,
+            conversation_history=query_request.conversation_history or [],
+        )
         
         # Only fetch expensive operations when explicitly requested
         map_data = None
@@ -113,13 +125,38 @@ async def query_ontology(request: Request, query_request: QueryRequest):
     elapsed_ms = (perf_counter() - started) * 1000
 
     return QueryResponse(
-        question=query_request.question,
+        status="success",
+        question=normalized_question,
+        response=rag_result.get("answer", "No answer available"),
         answer=rag_result.get("answer", "No answer available"),
+        context=[
+            {"type": "entity", "data": entity.model_dump()}
+            for entity in entities[:10]
+        ] + [
+            {"type": "relationship", "data": rel}
+            for rel in (rag_result.get("relationships", []) or [])[:10]
+        ],
+        metadata={
+            "query_time_ms": round(elapsed_ms, 2),
+            "confidence": confidence_score,
+            "confidence_label": confidence_level,
+            "domain": query_request.domain,
+            "include_sources": bool(query_request.include_sources),
+            "include_map_data": bool(query_request.include_map_data),
+            "include_risk_analysis": bool(query_request.include_risk_analysis),
+            "context_used": rag_result.get("context_used", ""),
+            "response_contract": {
+                "answer": "string",
+                "sources": "array",
+                "context_used": "string",
+                "confidence": "high|medium|low",
+            },
+        },
         explanation=AnswerExplanation(
             reasoning_chain=rag_result.get("reasoning_chain", []),
             supporting_facts=supporting_facts,
             confidence_level=confidence_level,
-            data_sources=["knowledge_graph", "llm_generation"],
+            data_sources=rag_result.get("data_sources", ["knowledge_graph", "llm_generation"]),
         ),
         entities=entities,
         relationships=rag_result.get("relationships", []),

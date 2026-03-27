@@ -76,6 +76,8 @@ class PostgresClient:
         parameters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """Execute a raw SQL query and return results"""
+        if not self.engine:
+            raise RuntimeError("PostgreSQL not connected")
         if parameters is None:
             parameters = {}
         
@@ -95,6 +97,8 @@ class PostgresClient:
         parameters: Optional[Dict[str, Any]] = None
     ) -> int:
         """Execute a write query and return affected rows"""
+        if not self.engine:
+            raise RuntimeError("PostgreSQL not connected")
         if parameters is None:
             parameters = {}
         
@@ -104,6 +108,25 @@ class PostgresClient:
                 return result.rowcount
         except Exception as e:
             logger.error(f"Write execution failed: {e}\nQuery: {query}")
+            raise
+
+    async def execute_write_many(
+        self,
+        query: str,
+        parameters: List[Dict[str, Any]],
+    ) -> int:
+        """Execute a parameterized write query for multiple rows in one transaction."""
+        if not self.engine:
+            raise RuntimeError("PostgreSQL not connected")
+        if not parameters:
+            return 0
+
+        try:
+            async with self.engine.begin() as conn:
+                result = await conn.execute(text(query), parameters)
+                return result.rowcount
+        except Exception as e:
+            logger.error(f"Batch write execution failed: {e}\nQuery: {query}")
             raise
 
 

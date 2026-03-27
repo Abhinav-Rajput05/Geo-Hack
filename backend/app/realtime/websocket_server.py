@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -39,6 +40,12 @@ class WebSocketManager:
         async with self._lock:
             self._clients.pop(websocket, None)
         logger.info("[WS] Client disconnected")
+
+    async def update_subscription(self, websocket: WebSocket, category: Optional[str]) -> None:
+        normalized = category.lower().strip() if category else None
+        async with self._lock:
+            if websocket in self._clients:
+                self._clients[websocket] = ClientSubscription(category=normalized)
 
     async def broadcast(self, event: Dict) -> None:
         if self._throttle_ms > 0:
@@ -91,9 +98,35 @@ async def news_websocket(websocket: WebSocket, category: Optional[str] = None, t
     await ws_manager.connect(websocket, category=category)
     try:
         while True:
-            # Keep the socket open. Client can optionally send pings/messages.
-            await websocket.receive_text()
+            # Handle client messages for ping/health and optional re-subscription.
+            raw = await websocket.receive_text()
+            if not raw:
+                continue
+
+            if raw.strip().lower() == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json(
+                    {"type": "error", "message": "Invalid JSON payload", "hint": "Send JSON or 'ping'"}
+                )
+                continue
+
+            msg_type = str(message.get("type", "")).lower()
+            if msg_type == "subscribe":
+                requested = message.get("category")
+                if requested is not None and not isinstance(requested, str):
+                    await websocket.send_json({"type": "error", "message": "'category' must be a string"})
+                    continue
+                await ws_manager.update_subscription(websocket, requested)
+                await websocket.send_json({"type": "ack", "message": "subscription updated", "category": requested})
+            else:
+                await websocket.send_json({"type": "ack", "message": "received"})
     except WebSocketDisconnect:
         await ws_manager.disconnect(websocket)
-    except Exception:
+    except Exception as exc:
+        logger.exception("[WS] Unexpected websocket error: %s", exc)
         await ws_manager.disconnect(websocket)
