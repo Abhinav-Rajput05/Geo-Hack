@@ -2,6 +2,7 @@
 Ontology API Endpoints - Knowledge Graph Management
 """
 from fastapi import APIRouter, HTTPException
+from loguru import logger
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -219,12 +220,10 @@ async def get_entity(entity_id: str):
 async def get_entity_relationships(
     entity_id: str,
     relationship_type: Optional[str] = None,
-    direction: str = "both",  # outgoing, incoming, both
+    direction: str = "both",
     limit: int = 50
 ):
-    """
-    Get relationships for a specific entity
-    """
+    """Get relationships for a specific entity"""
     try:
         relationships = await ontology_service.get_relationships(
             entity_id,
@@ -238,7 +237,13 @@ async def get_entity_relationships(
             "total": len(relationships)
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch relationships: {e}") from e
+        logger.warning(f"Relationships fetch failed for {entity_id}: {e}")
+        # Return empty instead of 500 — graceful degradation
+        return {
+            "entity_id": entity_id,
+            "relationships": [],
+            "total": 0
+        }
 
 
 @router.get("/search")
@@ -297,3 +302,77 @@ async def get_entity_subgraph(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch subgraph: {e}") from e
+
+
+@router.get("/graph")
+async def get_full_graph(limit: int = 80):
+    """
+    Get full knowledge graph nodes and edges for visualization
+    """
+    try:
+        from app.database.neo4j_client import neo4j_client
+
+        nodes_result = await neo4j_client.execute_query(
+            """
+            MATCH (e:Entity)
+            RETURN id(e) as id, e.name as name, e.type as type
+            ORDER BY e.type, e.name
+            LIMIT $limit
+            """,
+            {"limit": limit},
+        )
+
+        node_ids = {row["id"] for row in nodes_result}
+
+        edges_result = await neo4j_client.execute_query(
+            """
+            MATCH (a:Entity)-[r]->(b:Entity)
+            WHERE id(a) IN $ids AND id(b) IN $ids
+            RETURN id(a) as source, id(b) as target,
+                   coalesce(r.type, type(r)) as type
+            LIMIT $limit
+            """,
+            {"ids": list(node_ids), "limit": limit * 3},
+        )
+
+        nodes = [
+            {"id": str(row["id"]), "name": row["name"] or "Unknown", "type": row["type"] or "Entity"}
+            for row in nodes_result
+        ]
+        edges = [
+            {"source": str(row["source"]), "target": str(row["target"]), "type": row["type"] or "RELATES"}
+            for row in edges_result
+        ]
+
+        return {"nodes": nodes, "edges": edges}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch graph: {e}") from e
+
+
+@router.get("/entities")
+async def list_entities(
+    entity_type: Optional[str] = None,
+    limit: int = 60,
+):
+    """List entities for graph explorer fallback"""
+    try:
+        from app.database.neo4j_client import neo4j_client
+
+        if entity_type:
+            result = await neo4j_client.execute_query(
+                "MATCH (e:Entity {type: $t}) RETURN id(e) as id, e.name as name, e.type as type LIMIT $limit",
+                {"t": entity_type, "limit": limit},
+            )
+        else:
+            result = await neo4j_client.execute_query(
+                "MATCH (e:Entity) RETURN id(e) as id, e.name as name, e.type as type ORDER BY e.type LIMIT $limit",
+                {"limit": limit},
+            )
+
+        return [
+            {"id": str(row["id"]), "name": row["name"] or "Unknown", "type": row["type"] or "Entity"}
+            for row in result
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list entities: {e}") from e

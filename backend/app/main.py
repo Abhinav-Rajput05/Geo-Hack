@@ -73,6 +73,29 @@ async def lifespan(app: FastAPI):
         redis_event_consumer.run(app.state.realtime_stop_event)
     )
 
+    # Background ingestion loop — runs every INGESTION_INTERVAL_MINUTES
+    async def _ingestion_loop(stop_event: asyncio.Event) -> None:
+        interval = settings.INGESTION_INTERVAL_MINUTES * 60
+        logger.info(f"Background ingestion loop started (every {settings.INGESTION_INTERVAL_MINUTES} min)")
+        while not stop_event.is_set():
+            await asyncio.sleep(interval)
+            if stop_event.is_set():
+                break
+            try:
+                result = await realtime_ingestion_pipeline.run_once(limit_per_source=30)
+                # Invalidate news cache so frontend gets fresh data
+                await redis_client.delete("news:articles:v1")
+                logger.info(
+                    f"[LOOP] Ingestion: unique={result.get('unique_articles', 0)}, "
+                    f"neo4j={result.get('persisted_to_neo4j', 0)}"
+                )
+            except Exception as e:
+                logger.error(f"[LOOP] Ingestion failed: {e}")
+
+    app.state.ingestion_loop_task = asyncio.create_task(
+        _ingestion_loop(app.state.realtime_stop_event)
+    )
+
     if settings.startup_ingestion_enabled:
         try:
             logger.info(
@@ -102,6 +125,12 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "realtime_consumer_task"):
         try:
             await app.state.realtime_consumer_task
+        except Exception:
+            pass
+    if hasattr(app.state, "ingestion_loop_task"):
+        app.state.ingestion_loop_task.cancel()
+        try:
+            await app.state.ingestion_loop_task
         except Exception:
             pass
     

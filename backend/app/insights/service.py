@@ -4,7 +4,9 @@ Insights Service - Real-time Risk Analysis and Analytics
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from dateutil import parser as date_parser
+from loguru import logger
 from app.ontology.ontology_service import ontology_service
+from app.database.neo4j_client import neo4j_client
 
 
 class InsightsService:
@@ -322,9 +324,7 @@ class InsightsService:
         """
         
         try:
-            from app.database.neo4j_client import Neo4jClient
-            neo4j = Neo4jClient()
-            results = await neo4j.execute_query(query, {"entity_type": entity_type})
+            results = await neo4j_client.execute_query(query, {"entity_type": entity_type})
             
             if not results or len(results) == 0:
                 centrality = 0.0

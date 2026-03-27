@@ -22,7 +22,7 @@ router = APIRouter()
 
 NEWS_CACHE_KEY = "news:articles:v1"
 NEWS_STATUS_KEY = "news:status:v1"
-NEWS_CACHE_TTL_SECONDS = 300
+NEWS_CACHE_TTL_SECONDS = 60  # 1 minute — fresh news every minute
 ARTICLES_TABLE = "articles"
 
 

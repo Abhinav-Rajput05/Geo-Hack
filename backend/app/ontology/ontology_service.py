@@ -233,18 +233,18 @@ class OntologyService:
         UNWIND nodes as n
         UNWIND rels as r
         WITH DISTINCT n, r
-        RETURN collect(DISTINCT {
+        RETURN collect(DISTINCT {{
             id: id(n),
             name: n.name,
             type: n.type,
             properties: properties(n)
-        }) as nodes,
-        collect(DISTINCT {
+        }}) as nodes,
+        collect(DISTINCT {{
             source: id(startNode(r)),
             target: id(endNode(r)),
             type: type(r),
             properties: properties(r)
-        }) as edges
+        }}) as edges
         LIMIT 1
         """
         

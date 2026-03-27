@@ -47,10 +47,10 @@ class Settings(BaseSettings):
     
     # RSS Feed Sources
     RSS_FEEDS: list = [
-        "https://feeds.reuters.com/reuters/topNews",
         "https://feeds.bbci.co.uk/news/rss.xml",
-        "https://feeds.reuters.com/reuters/businessNews",
-        "https://feeds.reuters.com/reuters/worldNews",
+        "https://rss.cnn.com/rss/edition.rss",
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://feeds.aljazeera.com/asr/home",
     ]
     
     # Data Ingestion Settings

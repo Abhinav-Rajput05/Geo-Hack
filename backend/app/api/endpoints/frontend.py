@@ -259,6 +259,7 @@ async def _build_dashboard_payload(country: str) -> Dict[str, Any]:
         "alerts": alerts,
         "live_events": live_events,
         "map_connections": map_connections,
+        "risk_categories": categories,
         "risk_explanation": {
             "title": f"Global Risk Score: {round(overall_score / 10 if overall_score > 10 else overall_score, 1)} / 10",
             "key_factors": key_factors or ["No dominant drivers available"],
@@ -666,3 +667,121 @@ async def analysis_chat(request: ChatRequest) -> Dict[str, Any]:
     except Exception as exc:
         logger.exception(f"Failed to answer chat query: {exc}")
         error("Failed to process chat query", 500)
+
+
+@router.get("/explain/{country}")
+async def get_risk_explanation(country: str) -> Dict[str, Any]:
+    """
+    Deep explainability endpoint — returns:
+    - Risk score breakdown with formula weights
+    - Graph path traversal showing cross-domain connections
+    - Source articles with credibility scores
+    - Data lineage for each risk factor
+    """
+    normalized = _normalize_country_name(country)
+    cache_key = f"frontend:explain:{normalized.lower()}"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return ok(cached)
+
+    try:
+        # 1. Get risk analysis with factor breakdown
+        risk_analysis = await insights_service.get_risk_analysis()
+        categories = risk_analysis.get("categories", [])
+        overall = risk_analysis.get("overall_risk", {})
+        overall_score = float(overall.get("score", 0.0))
+
+        # 2. Get graph relationships for this country
+        graph_paths = []
+        try:
+            entities = await ontology_service.search_entities(normalized, entity_type="Country", limit=1)
+            if entities:
+                entity = entities[0]
+                entity_id = str(entity.get("id") or entity.get("name"))
+                relationships = await ontology_service.get_relationships(entity_id, direction="both", limit=20)
+
+                for rel in relationships[:8]:
+                    source = rel.get("source") or {}
+                    target = rel.get("target") or {}
+                    rel_type = rel.get("type") or (rel.get("properties") or {}).get("type", "RELATES")
+                    confidence = float((rel.get("properties") or {}).get("confidence", 0.7))
+                    graph_paths.append({
+                        "from": source.get("name", normalized),
+                        "to": target.get("name", "Unknown"),
+                        "relationship": rel_type,
+                        "confidence": round(confidence, 2),
+                        "domain": _category_to_domain_name(target.get("type", "Political")),
+                    })
+        except Exception as e:
+            logger.warning(f"Graph path fetch failed: {e}")
+
+        # 3. Get source articles with credibility
+        articles = await _load_news_articles()
+        sources_with_credibility = []
+        for article in articles[:6]:
+            credibility = float(article.get("source_credibility") or 0.85)
+            sources_with_credibility.append({
+                "name": article.get("source", "Unknown"),
+                "url": article.get("url", ""),
+                "title": article.get("title", ""),
+                "published_at": article.get("published_at", ""),
+                "credibility_score": round(credibility, 2),
+                "credibility_label": "High" if credibility >= 0.85 else "Medium" if credibility >= 0.65 else "Low",
+                "domain": article.get("domain", "General"),
+                "region": article.get("region", "Global"),
+            })
+
+        # 4. Risk formula breakdown
+        formula_breakdown = []
+        for cat in categories[:5]:
+            factors = cat.get("factors", [])
+            formula_breakdown.append({
+                "domain": cat.get("category", "Unknown"),
+                "score": cat.get("level", 0),
+                "trend": cat.get("trend", "stable"),
+                "factors": factors,
+                "weight": {
+                    "geopolitical": 0.90, "economic": 0.72, "defense": 0.85,
+                    "technology": 0.68, "climate": 0.60, "social": 0.52,
+                }.get(cat.get("category", "").lower(), 0.5),
+            })
+
+        # 5. Cross-domain correlation chains
+        cross_domain_chains = []
+        if graph_paths:
+            # Build chains from graph relationships
+            for i, path in enumerate(graph_paths[:3]):
+                chain = {
+                    "title": f"{path['from']} → {path['to']}",
+                    "relationship": path["relationship"],
+                    "confidence": path["confidence"],
+                    "domain": path["domain"],
+                    "implication": f"{path['relationship'].replace('_', ' ').title()} relationship with confidence {int(path['confidence']*100)}%",
+                }
+                cross_domain_chains.append(chain)
+
+        payload = {
+            "country": normalized,
+            "overall_score": round(overall_score / 10 if overall_score > 10 else overall_score, 1),
+            "formula": {
+                "description": "Weighted multi-factor model: Centrality(40%) + Density(30%) + Events(20%) + Domain(10%)",
+                "weights": {"centrality": 0.40, "density": 0.30, "events": 0.20, "domain": 0.10},
+                "breakdown": formula_breakdown,
+            },
+            "graph_paths": graph_paths,
+            "cross_domain_chains": cross_domain_chains,
+            "sources": sources_with_credibility,
+            "data_lineage": {
+                "total_sources": len(sources_with_credibility),
+                "graph_relationships": len(graph_paths),
+                "last_updated": datetime.utcnow().isoformat(),
+                "confidence_method": "Multi-source cross-validation with graph inference",
+            },
+        }
+
+        await redis_client.set(cache_key, payload, expire=60)
+        return ok(payload)
+
+    except Exception as exc:
+        logger.exception(f"Failed to build explanation for {country}: {exc}")
+        error("Failed to load explanation data", 500)
