@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { getAnalysis, getDashboard, getIntelligence, sendChat } from "@/lib/api";
+import { getAnalysis, getDashboard, getIntelligence, getExplanation, sendChat } from "@/lib/api";
 
 export function useDashboardData(country: string) {
   return useQuery({
@@ -22,6 +22,15 @@ export function useAnalysisData(country: string) {
     queryKey: ["analysis", country],
     queryFn: () => getAnalysis(country),
     staleTime: 60_000,
+  });
+}
+
+export function useExplanationData(country: string, enabled = false) {
+  return useQuery({
+    queryKey: ["explain", country],
+    queryFn: () => getExplanation(country),
+    staleTime: 60_000,
+    enabled,
   });
 }
 

@@ -13,7 +13,13 @@ interface HeatmapCountry {
   region: string;
 }
 
-const INDIA_ID = "356";
+// Dynamic ISO mapping — no hardcoded country
+const COUNTRY_ISO: Record<string, string> = {
+  "India": "356", "China": "156", "United States": "840", "Russia": "643",
+  "Pakistan": "586", "Japan": "392", "Germany": "276", "Israel": "376",
+  "Iran": "364", "Saudi Arabia": "682", "Brazil": "076", "UK": "826",
+  "France": "250", "Australia": "036", "Turkey": "792", "Ukraine": "804",
+};
 
 function geoPathToSvg(coordinates: number[][][]): string {
   return coordinates
@@ -78,6 +84,18 @@ const RiskHeatmap = () => {
     }));
   }, []);
 
+  const selectedIso = COUNTRY_ISO[selectedCountry] ?? "";
+
+  // Build risk lookup from heatmap data for country fill coloring
+  const riskByIso = useMemo(() => {
+    const map: Record<string, number> = {};
+    countriesData.forEach(c => {
+      const iso = COUNTRY_ISO[c.name];
+      if (iso) map[iso] = c.risk;
+    });
+    return map;
+  }, [countriesData]);
+
   useEffect(() => {
     let f = 0;
     const tick = () => {
@@ -99,15 +117,33 @@ const RiskHeatmap = () => {
           <line key={`hg-${i}`} x1={0} y1={i * 40} x2={1000} y2={i * 40} stroke="rgba(255,255,255,0.02)" strokeWidth={0.5} />
         ))}
 
-        {mapFeatures.map((c) => (
-          <path
-            key={c.id}
-            d={c.d}
-            fill={c.id === INDIA_ID ? "rgba(228,105,80,0.12)" : "rgba(255,255,255,0.04)"}
-            stroke={c.id === INDIA_ID ? "rgba(228,105,80,0.35)" : "rgba(255,255,255,0.08)"}
-            strokeWidth={c.id === INDIA_ID ? 1 : 0.4}
-          />
-        ))}
+        {mapFeatures.map((c) => {
+          const isFocus = c.id === selectedIso;
+          const countryRisk = riskByIso[c.id];
+          const hasRisk = countryRisk !== undefined;
+          return (
+            <path
+              key={c.id}
+              d={c.d}
+              fill={
+                isFocus
+                  ? "rgba(228,105,80,0.18)"
+                  : hasRisk
+                  ? `rgba(228,80,60,${0.04 + (countryRisk / 10) * 0.12})`
+                  : "rgba(255,255,255,0.04)"
+              }
+              stroke={
+                isFocus
+                  ? "rgba(228,105,80,0.5)"
+                  : hasRisk
+                  ? `rgba(228,130,80,${0.1 + (countryRisk / 10) * 0.3})`
+                  : "rgba(255,255,255,0.07)"
+              }
+              strokeWidth={isFocus ? 1.2 : hasRisk ? 0.7 : 0.4}
+              style={{ transition: "fill 0.5s, stroke 0.5s" }}
+            />
+          );
+        })}
 
         {countriesData.map((c) => {
           const isSelected = c.name === selectedCountry;

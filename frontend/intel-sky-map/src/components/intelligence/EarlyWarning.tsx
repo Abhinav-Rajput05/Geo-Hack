@@ -62,9 +62,7 @@ const EarlyWarning = () => {
       <div className="px-4 py-2.5 border-t border-border">
         <div className="flex items-center gap-1.5 text-[9px] text-text-secondary">
           <TrendingUp className="w-3 h-3 text-coral" />
-          <span>
-            AI confidence: <span className="text-coral font-semibold">78%</span>
-          </span>
+          <span>AI-projected · {items.length} signals active</span>
         </div>
       </div>
     </div>

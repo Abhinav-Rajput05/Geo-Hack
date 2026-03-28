@@ -172,7 +172,11 @@ Example output: ["United States", "NATO", "China"]"""
             elif isinstance(data, list):
                 return data
             else:
-                logger.warning(f"Unexpected LLM response format: {type(data)}")
+                # Try to extract any list value from the dict
+                for v in data.values():
+                    if isinstance(v, list):
+                        return v
+                logger.warning(f"Unexpected LLM response format: {type(data)}, keys: {list(data.keys())}")
                 return []
 
         except Exception as e:
@@ -182,51 +186,66 @@ Example output: ["United States", "NATO", "China"]"""
     async def _retrieve_context(self, entities: List[str]) -> Dict[str, Any]:
         """
         Retrieve context from knowledge graph.
-        
-        FIXED: Parallelized entity and relationship lookups using asyncio.gather.
-        Old: Sequential lookups (2-10x slower)
-        New: Parallel execution (all lookups run concurrently)
+        Parallelized entity and relationship lookups using asyncio.gather.
+        Also does direct entity search for better recall.
         """
-        
-        # FIXED: Parallel entity and relationship lookups
         entity_tasks = []
         relationship_tasks = []
-        
+        search_tasks = []
+
         for entity_name in entities:
-            # Create tasks for parallel execution
             entity_tasks.append(
                 ontology_service.get_related_entities(entity_name, limit=self.top_k)
             )
             relationship_tasks.append(
                 ontology_service.get_relationships(entity_name, direction="both", limit=10)
             )
-        
-        # Execute all lookups in parallel
+            # Also search by name directly for better recall
+            search_tasks.append(
+                ontology_service.search_entities(entity_name, limit=5)
+            )
+
         try:
             entity_results = await asyncio.gather(*entity_tasks, return_exceptions=True)
             relationship_results = await asyncio.gather(*relationship_tasks, return_exceptions=True)
+            search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
         except Exception as e:
             logger.error(f"Error in parallel graph lookups: {e}", exc_info=True)
             entity_results = []
             relationship_results = []
-        
-        # Combine results, filtering out exceptions
+            search_results = []
+
         all_entities = []
         all_relationships = []
-        
+
         for idx, result in enumerate(entity_results):
             if isinstance(result, Exception):
                 logger.warning(f"Entity lookup failed for '{entities[idx]}': {result}")
             elif result:
                 all_entities.extend(result)
-        
+
+        # Add directly searched entities too
+        for idx, result in enumerate(search_results):
+            if isinstance(result, Exception):
+                pass
+            elif result:
+                all_entities.extend(result)
+
         for idx, result in enumerate(relationship_results):
             if isinstance(result, Exception):
                 logger.warning(f"Relationship lookup failed for '{entities[idx]}': {result}")
             elif result:
                 all_relationships.extend(result)
 
-        # Get subgraph for first entity if available
+        # Deduplicate entities by name
+        seen_names = set()
+        unique_entities = []
+        for e in all_entities:
+            name = e.get("name", "")
+            if name and name not in seen_names:
+                seen_names.add(name)
+                unique_entities.append(e)
+
         subgraph = {}
         if entities:
             try:
@@ -237,12 +256,8 @@ Example output: ["United States", "NATO", "China"]"""
                 logger.warning(f"Graph context subgraph lookup failed for '{entities[0]}': {exc}")
                 subgraph = {}
 
-        # FIXED: Removed dead code (vector_texts and vector_metadata were never used)
-        # Vector store writes during query time were commented out - rightfully so
-        # to prevent pollution of embedding space and unbounded memory growth
-
         return {
-            "entities": all_entities[:20],  # Limit context size
+            "entities": unique_entities[:20],
             "relationships": all_relationships[:20],
             "subgraph": subgraph,
         }
@@ -263,6 +278,10 @@ Example output: ["United States", "NATO", "China"]"""
             ent = (entity or "").strip()
             if ent:
                 patterns.append(f"%{ent[:120]}%")
+                # Also add individual words from entity name for better recall
+                for word in ent.split():
+                    if len(word) > 4:
+                        patterns.append(f"%{word}%")
 
         if not patterns:
             return []

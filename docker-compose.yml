@@ -1,4 +1,21 @@
 services:
+  neo4j:
+    image: neo4j:5
+    container_name: ontology-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/ontology123
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "ontology123", "RETURN 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
   redis:
     image: redis:7-alpine
     container_name: ontology-redis
@@ -15,4 +32,5 @@ services:
       retries: 10
 
 volumes:
+  neo4j_data:
   redis_data:

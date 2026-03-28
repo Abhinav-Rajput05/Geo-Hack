@@ -53,21 +53,21 @@ const CausalChain = () => {
   const openNodeExplain = (node: CausalNode) => {
     const relatedEdges = edges.filter((e) => e.from === node.id || e.to === node.id);
     const avgConfidence =
-      relatedEdges.length > 0 ? Math.round((relatedEdges.reduce((s, e) => s + e.confidence, 0) / relatedEdges.length) * 100) : 70;
+      relatedEdges.length > 0
+        ? Math.round((relatedEdges.reduce((s, e) => s + e.confidence, 0) / relatedEdges.length) * 100)
+        : 70;
 
     setExplainData({
       title: node.title,
       keyFactors: node.factors,
       chain: nodes.map((n) => n.title),
       confidence: avgConfidence,
-      sources: [
-        {
-          name: "Graph Intelligence Engine",
-          url: "#",
-          timestamp: new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC",
-          reliability: "Model",
-        },
-      ],
+      sources: relatedEdges.slice(0, 3).map((e) => ({
+        name: `${nodes.find(n => n.id === e.from)?.title ?? "Node"} → ${nodes.find(n => n.id === e.to)?.title ?? "Node"}`,
+        url: "#",
+        timestamp: new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC",
+        reliability: `${Math.round(e.confidence * 100)}% confidence`,
+      })),
     });
     setExplainOpen(true);
   };

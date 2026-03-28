@@ -1,35 +1,48 @@
-# Environment files
+# Environment files — NEVER commit these
 .env
 .env.*
+backend/.env
+backend/.env.*
+*.env
 
-.pdf
-
-node_modules/
-.env# Node.js
-node_modules/
-package-lock.json
-frontend/node_modules/
-plans/
+# Logs
+logs.txt
+seed_logs.txt
+*.log
 
 # Python
 venv/
+backend/venv/
 __pycache__/
+**/__pycache__/
 *.pyc
+*.pyo
+backend/celerybeat-schedule.*
+backend/celerybeat-schedule.bak
+backend/celerybeat-schedule.dat
+backend/celerybeat-schedule.dir
 
-# Environment variables
-.env
+# Node
+node_modules/
+frontend/intel-sky-map/node_modules/
+frontend/intel-sky-map/dist/
+package-lock.json
 
-# Build / logs
+# Build
 dist/
 build/
-*.log
 
 # IDE
 .vscode/
 .idea/
 
-# OS files
+# OS
 .DS_Store
 Thumbs.db
-dist/
-build/
+
+# Plans / PDFs
+plans/
+*.pdf
+
+# Kiro
+.kilo/

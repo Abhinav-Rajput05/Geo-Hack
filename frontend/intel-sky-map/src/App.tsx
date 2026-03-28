@@ -7,6 +7,7 @@ import { IntelligenceProvider } from "@/context/IntelligenceContext";
 import Index from "./pages/Index.tsx";
 import Intelligence from "./pages/Intelligence.tsx";
 import Analysis from "./pages/Analysis.tsx";
+import GraphExplorer from "./pages/GraphExplorer.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
 const queryClient = new QueryClient();
@@ -22,6 +23,7 @@ const App = () => (
             <Route path="/" element={<Index />} />
             <Route path="/intelligence" element={<Intelligence />} />
             <Route path="/analysis" element={<Analysis />} />
+            <Route path="/graph" element={<GraphExplorer />} />
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
             <Route path="*" element={<NotFound />} />
           </Routes>

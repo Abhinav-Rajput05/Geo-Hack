@@ -1,23 +1,14 @@
 ﻿import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  RadarChart,
-  PolarGrid,
-  PolarAngleAxis,
-  PolarRadiusAxis,
-  Radar,
-  Legend,
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis,
+  PolarRadiusAxis, Radar, Legend,
 } from "recharts";
-import { ArrowLeft, Globe } from "lucide-react";
+import { ArrowLeft, Globe, Loader2 } from "lucide-react";
 import { useIntelligence } from "@/context/IntelligenceContext";
 import { useAnalysisData } from "@/hooks/useBackendData";
+import { sendChat } from "@/lib/api";
 
 const riskDrivers = ["Geopolitical", "Economic", "Technological", "Defense", "Climate", "Social"];
 
@@ -27,21 +18,27 @@ const Analysis = () => {
   const { data: analysisData } = useAnalysisData(selectedCountry);
 
   const [prompt, setPrompt] = useState("Generate deep-dive analysis based on current global risk signals and cross-domain dependencies.");
+  const [generating, setGenerating] = useState(false);
+  const [aiResult, setAiResult] = useState<string | null>(null);
+
+  const handleGenerate = async () => {
+    if (!prompt.trim() || generating) return;
+    setGenerating(true);
+    setAiResult(null);
+    try {
+      const res = await sendChat(prompt, selectedCountry);
+      setAiResult(res.answer);
+    } catch {
+      setAiResult("Failed to generate analysis. Please try again.");
+    } finally {
+      setGenerating(false);
+    }
+  };
 
   const chartSeries = useMemo(() => {
     const timeline = analysisData?.risk_timeline ?? [];
-    const fallback = [24, 20, 34, 26, 41, 28];
-
-    if (timeline.length === 0) {
-      return fallback.map((value, idx) => ({
-        month: ["Jan 24", "May 24", "Jun 24", "Jul 24", "Sep 24", "Dec 24"][idx],
-        geopolitical: value,
-        economic: Math.max(10, value - 7),
-      }));
-    }
-
-    const points = timeline.slice(-6);
-    return points.map((point, idx) => {
+    if (timeline.length === 0) return [];
+    return timeline.slice(-6).map((point, idx) => {
       const date = new Date(point.date);
       const label = date.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
       const geo = Math.round(point.score * 10);
@@ -53,44 +50,35 @@ const Analysis = () => {
     });
   }, [analysisData?.risk_timeline]);
 
-  const radarData = useMemo(
-    () =>
-      riskDrivers.map((name, idx) => ({
-        driver: name,
-        current: Math.max(22, 76 - idx * 8),
-        economic: Math.max(18, 58 - idx * 6),
-      })),
-    []
-  );
+  const radarData = useMemo(() => {
+    const recommendations = analysisData?.policy_recommendations ?? [];
+    return riskDrivers.map((name, idx) => ({
+      driver: name,
+      current: recommendations[idx] ? Math.min(100, (recommendations[idx].items.length * 15) + 30) : 0,
+      economic: recommendations[idx] ? Math.min(100, (recommendations[idx].items.length * 12) + 20) : 0,
+    }));
+  }, [analysisData?.policy_recommendations]);
 
   const tableRows = useMemo(() => {
     const recommendations = analysisData?.policy_recommendations ?? [];
-    if (recommendations.length === 0) {
-      return [];
-    }
-
-    const region = selectedCountry;
     return recommendations.slice(0, 5).map((section, idx) => ({
-      riskFactor: riskDrivers[idx] ?? "Geopolitical",
-      region,
-      riskScore: Math.max(20, 71 - idx * 9),
+      riskFactor: riskDrivers[idx] ?? section.title,
+      region: selectedCountry,
       driver: section.title,
-      summary: section.items[0] ?? "Monitoring strategic posture and escalation signals.",
+      summary: section.items[0] ?? "Monitoring strategic posture.",
       action: section.items[1] ?? "Update contingency action plan.",
     }));
   }, [analysisData?.policy_recommendations, selectedCountry]);
 
   const generatedNotes = useMemo(() => {
     const src = analysisData?.source_citations ?? [];
-    if (src.length === 0) {
-      return [
-        `AI Analysis: ${selectedCountry} remains a primary concern due to compounded geopolitical and economic stressors.`,
-        "AI Analysis: Scenario modeling recommends accelerated diplomatic and supply-chain coordination.",
-      ];
-    }
-
-    return src.slice(0, 4).map((s) => `AI Analysis: ${s.name} indicates elevated volatility with reliability at ${s.reliability}%.`);
-  }, [analysisData?.source_citations, selectedCountry]);
+    return src.slice(0, 4).map((s) => {
+      const rel = typeof s.reliability === "number" && s.reliability > 0
+        ? s.reliability
+        : 85; // default credibility if missing
+      return `${s.name} — reliability ${rel}%`;
+    });
+  }, [analysisData?.source_citations]);
 
   return (
     <div className="relative h-screen overflow-hidden bg-intel-canvas text-foreground">
@@ -158,18 +146,39 @@ const Analysis = () => {
             <textarea
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              className="mt-2 h-28 rounded-lg border border-border/70 bg-accent/50 p-3 text-sm text-foreground outline-none focus:border-coral/60"
+              className="mt-2 h-28 rounded-lg border border-border/70 bg-accent/50 p-3 text-sm text-foreground outline-none focus:border-coral/60 resize-none"
             />
-            <button className="mt-3 self-end rounded-md bg-coral px-4 py-2 text-sm font-semibold text-white transition hover:bg-coral-muted">
-              Generate Analysis
+            <button
+              onClick={handleGenerate}
+              disabled={generating}
+              className="mt-3 self-end flex items-center gap-2 rounded-md bg-coral px-4 py-2 text-sm font-semibold text-white transition hover:bg-coral-muted disabled:opacity-60"
+            >
+              {generating && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              {generating ? "Generating..." : "Generate Analysis"}
             </button>
 
             <div className="mt-3 min-h-0 flex-1 overflow-y-auto rounded-lg border border-border/60 bg-accent/30 p-3 scrollbar-thin">
-              {generatedNotes.map((note, idx) => (
-                <p key={idx} className="mb-3 text-sm leading-relaxed text-foreground/90">
-                  {note}
-                </p>
-              ))}
+              {aiResult ? (
+                <p className="text-sm leading-relaxed text-foreground/90 whitespace-pre-wrap">{aiResult}</p>
+              ) : generating ? (
+                <div className="flex items-center gap-2 text-sm text-text-secondary">
+                  <Loader2 className="w-4 h-4 animate-spin text-coral" />
+                  Running GraphRAG analysis...
+                </div>
+              ) : generatedNotes.length > 0 ? (
+                <>
+                  <p className="text-[10px] text-text-secondary uppercase tracking-wider mb-2">Source Intelligence</p>
+                  {generatedNotes.map((note, idx) => (
+                    <p key={idx} className="mb-2 text-xs leading-relaxed text-foreground/80 flex items-start gap-2">
+                      <span className="w-1.5 h-1.5 rounded-full bg-coral mt-1.5 flex-shrink-0" />
+                      {note}
+                    </p>
+                  ))}
+                  <p className="mt-3 text-[10px] text-text-secondary">Click "Generate Analysis" to run AI deep-dive</p>
+                </>
+              ) : (
+                <p className="text-xs text-text-secondary">Enter a prompt and click Generate Analysis</p>
+              )}
             </div>
           </section>
 
@@ -181,7 +190,6 @@ const Analysis = () => {
                   <tr className="bg-white/5 text-left text-text-secondary">
                     <th className="px-3 py-2 font-semibold">Risk Factor</th>
                     <th className="px-3 py-2 font-semibold">Region</th>
-                    <th className="px-3 py-2 font-semibold">Risk Score</th>
                     <th className="px-3 py-2 font-semibold">Driver</th>
                     <th className="px-3 py-2 font-semibold">Analysis Summary</th>
                     <th className="px-3 py-2 font-semibold">Action</th>
@@ -192,9 +200,6 @@ const Analysis = () => {
                     <tr key={idx} className="border-t border-border/60">
                       <td className="px-3 py-2 text-foreground/90">{row.riskFactor}</td>
                       <td className="px-3 py-2 text-foreground/90">{row.region}</td>
-                      <td className="px-3 py-2">
-                        <span className="rounded bg-coral/20 px-2 py-1 font-semibold text-coral">{row.riskScore}</span>
-                      </td>
                       <td className="px-3 py-2 text-foreground/90">{row.driver}</td>
                       <td className="px-3 py-2 text-foreground/80">{row.summary}</td>
                       <td className="px-3 py-2 text-foreground/90">{row.action}</td>

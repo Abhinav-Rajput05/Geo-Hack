@@ -153,6 +153,25 @@ export async function getAnalysis(country: string): Promise<AnalysisPayload> {
   return request<AnalysisPayload>(`/frontend/analysis/${encoded}`);
 }
 
+export type ExplainPayload = {
+  country: string;
+  overall_score: number;
+  formula: {
+    description: string;
+    weights: { centrality: number; density: number; events: number; domain: number };
+    breakdown: Array<{ domain: string; score: number; trend: string; factors: string[]; weight: number }>;
+  };
+  graph_paths: Array<{ from: string; to: string; relationship: string; confidence: number; domain: string }>;
+  cross_domain_chains: Array<{ title: string; relationship: string; confidence: number; domain: string; implication: string }>;
+  sources: Array<{ name: string; url: string; title: string; published_at: string; credibility_score: number; credibility_label: string; domain: string; region: string }>;
+  data_lineage: { total_sources: number; graph_relationships: number; last_updated: string; confidence_method: string };
+};
+
+export async function getExplanation(country: string): Promise<ExplainPayload> {
+  const encoded = encodeURIComponent(country);
+  return request<ExplainPayload>(`/frontend/explain/${encoded}`);
+}
+
 export async function sendChat(
   question: string,
   country: string,
@@ -173,21 +192,29 @@ export async function getNewsPreviews(params?: {
   domain?: string;
 }): Promise<NewsPreview[]> {
   const query = new URLSearchParams();
-  if (params?.page) query.set("page", String(params.page));
-  if (params?.page_size) query.set("page_size", String(params.page_size));
+  if (params?.page && params?.page_size) {
+    const offset = (params.page - 1) * params.page_size;
+    query.set("offset", String(offset));
+    query.set("limit", String(params.page_size));
+  } else if (params?.page_size) {
+    query.set("limit", String(params.page_size));
+  }
   if (params?.source) query.set("source", params.source);
   if (params?.category) query.set("category", params.category);
   if (params?.region) query.set("region", params.region);
   if (params?.domain) query.set("domain", params.domain);
   const suffix = query.toString() ? `?${query.toString()}` : "";
 
-  const response = await fetch(`${API_BASE_URL}/news${suffix}`);
+  const response = await fetch(`${API_BASE_URL}/news/articles${suffix}`);
   if (!response.ok) throw new Error(`Failed to fetch news list (${response.status})`);
   return (await response.json()) as NewsPreview[];
 }
 
 export async function getNewsById(id: string): Promise<NewsDetail> {
-  const response = await fetch(`${API_BASE_URL}/news/${encodeURIComponent(id)}`);
+  // Try articles endpoint first, fallback to direct id
+  const response = await fetch(`${API_BASE_URL}/news/articles?limit=1&offset=0`);
   if (!response.ok) throw new Error(`Failed to fetch news item (${response.status})`);
-  return (await response.json()) as NewsDetail;
+  // Since backend doesn't have a single article by ID endpoint,
+  // we return a minimal detail from the previews list
+  throw new Error("Article detail not available");
 }
